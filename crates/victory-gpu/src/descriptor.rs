@@ -215,7 +215,7 @@ pub(crate) fn make_read(slots: &[u32]) {
             .map(|&(_, _, at)| unsafe { &*(at as *const Heap) })
             .filter(|heap| heap.desc.kind == VIEWS_KIND)
             .filter_map(|heap| heap.host.get()?.as_ref().map(|host| (heap, host)))
-            .flat_map(|(heap, host)| slots.iter().filter(|&&i| i < heap.desc.count).filter_map(|&i| host.unmade_placed(i)))
+            .flat_map(|(_, host)| slots.iter().filter_map(|&slot| host.unmade_placed(slot)))
             .collect()
     };
     #[cfg(test)]
@@ -235,9 +235,11 @@ pub(crate) fn make_read(slots: &[u32]) {
         if heap.desc.kind != VIEWS_KIND {
             continue;
         }
-        for &i in slots.iter().filter(|&&i| i < heap.desc.count) {
-            host.mirror(i, start + u64::from(i) * u64::from(step), true);
-            host.stamp_read(i);
+        for &slot in slots {
+            if let Some(i) = host.title_slot(slot) {
+                host.mirror(i, start + u64::from(i) * u64::from(step), true);
+                host.stamp_read(slot);
+            }
         }
     }
 }

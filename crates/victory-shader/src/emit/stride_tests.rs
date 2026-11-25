@@ -13,7 +13,10 @@ use windows::Win32::Graphics::Dxgi::Common::{
 };
 
 use super::host::{Dispatch, Host, Root, Stride, View};
-use super::{HostShader, StaticSampler, VIEW_INTEGER, VIEW_STRIDES, lower, validator};
+use super::{
+    HostShader, StaticSampler, VIEW_BLOCK_SHIFT, VIEW_BLOCKS, VIEW_INTEGER, VIEW_STRIDES, lower,
+    validator,
+};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
 };
@@ -310,16 +313,6 @@ fn a_heap_buffer_read_by_element_takes_the_views_stride() {
 /// indices"): a texture descriptor read as a buffer one is a wild address.
 #[test]
 fn a_heap_buffer_read_where_no_buffer_view_is_reads_zeros() {
-    let shader = build(
-        HEAP_ELEMENT_WAVE32,
-        vec![
-            param(RootType::Constants, 0),
-            param(RootType::ResourceHeap, 1),
-            param(RootType::Table, 2),
-        ],
-        vec![entry(ResourceType::Uav, 4, 2)],
-        32,
-    );
     let texel = [[1.0f32, 2.0, 3.0, 4.0]];
     let views = [View::RawUav(32), View::Texture(1, 1, &texel), View::NullBuffers];
     let _one = super::valu_tests::ONE_AT_A_TIME
@@ -331,6 +324,20 @@ fn a_heap_buffer_read_where_no_buffer_view_is_reads_zeros() {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
         };
+        // The null views lie at the end of the host's view heap, which is
+        // smaller on a host that caps it: translated for each host (the
+        // test host's heap for `View::NullBuffers` is sized the same way).
+        super::shader::TEST_VIEW_HEAP.set(Some((host.view_heap_limit(), false)));
+        let shader = build(
+            HEAP_ELEMENT_WAVE32,
+            vec![
+                param(RootType::Constants, 0),
+                param(RootType::ResourceHeap, 1),
+                param(RootType::Table, 2),
+            ],
+            vec![entry(ResourceType::Uav, 4, 2)],
+            32,
+        );
         let (root, pso) = host
             .compute_pipeline(&shader)
             .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
@@ -349,6 +356,8 @@ fn a_heap_buffer_read_where_no_buffer_view_is_reads_zeros() {
         let words = host
             .dispatch(&root, &pso, &dispatch)
             .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        // As other tests translate: for a heap of the default size.
+        super::shader::TEST_VIEW_HEAP.set(None);
         assert_eq!(words[0], [0; 32], "{label}");
         ran += 1;
     }
@@ -408,6 +417,83 @@ fn a_constant_buffer_through_the_heap_reads_as_a_raw_buffer() {
                     // User data, then the stride table: heap index 1 holds a
                     // buffer view.
                     roots: vec![(0, Root::Constants(ud)), (1, Root::View { srv: true, data: vec![4, 4] })],
+                    views: &views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        assert_eq!(words[0], vec![9; 32], "{label}");
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+/// On a host whose view heaps hold the title's slots by blocks (`emit`,
+/// "Heap indices"), an index a shader takes from the resource heap itself
+/// is the title's: the view-block table leads it to the host's slot. Here
+/// title slot 3 x 1,024 + 1, past the host's heap, lies at host slot 1.
+#[test]
+fn a_heap_index_goes_through_the_view_block_table() {
+    let layout = || {
+        vec![
+            param(RootType::Constants, 0),
+            param(RootType::ResourceHeap, 1),
+            param(RootType::Table, 2),
+        ]
+    };
+    let plain = build(HEAP_CONSTANT_WAVE32, layout(), vec![entry(ResourceType::Uav, 4, 2)], 32);
+    super::shader::TEST_VIEW_HEAP.set(Some((super::HEAP_VIEWS, true)));
+    let shader = build(HEAP_CONSTANT_WAVE32, layout(), vec![entry(ResourceType::Uav, 4, 2)], 32);
+    super::shader::TEST_VIEW_HEAP.set(None);
+    assert_eq!(shader.root_srvs, [VIEW_BLOCKS, VIEW_STRIDES]);
+    assert_ne!(shader.dxil, plain.dxil);
+    assert_eq!(shader.user_data, plain.user_data, "the same root arguments");
+    let data: Vec<u32> = vec![7, 8, 9, 10];
+    let views = [
+        View::RawUav(32),
+        View::Buffer {
+            data: &data,
+            stride: Stride::Raw,
+        },
+    ];
+    let title = (3 << VIEW_BLOCK_SHIFT) + 1;
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            ud[u.index as usize] = match u.root {
+                // The constants are at the title's heap index `title`; the
+                // UAV's table is at the host's index 0.
+                RootType::Constants => title,
+                RootType::Table => 0,
+                other => panic!("unexpected user data {other:?}"),
+            };
+        }
+        let words = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    // User data, the block table (the title's block 3 starts
+                    // at host slot 0; the other entries lead nowhere a view
+                    // is), then the stride table: host slot 1 holds a buffer
+                    // view.
+                    roots: vec![
+                        (0, Root::Constants(ud)),
+                        (1, Root::View { srv: true, data: vec![2, 2, 2, 0] }),
+                        (2, Root::View { srv: true, data: vec![4, 4] }),
+                    ],
                     views: &views,
                     samplers: &[],
                     groups: [1, 1, 1],

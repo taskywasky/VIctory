@@ -87,6 +87,21 @@ fn key(translator: &str, encoding: &[u8], limit: u32, wave: u32) -> [u8; 32] {
     *h.finalize().as_bytes()
 }
 
+/// [`build`] as this host's entries are keyed: a translation also depends
+/// on the host's view heaps where they are smaller than translations
+/// assume (`victory_shader::emit::set_view_heap`: `views` slots, which hold
+/// the title's by `blocks`). Elsewhere the build itself.
+fn host_build(build: &[u8; 32], views: u32, blocks: bool) -> [u8; 32] {
+    if (views, blocks) == (victory_shader::emit::HEAP_VIEWS, false) {
+        return *build;
+    }
+    let mut h = blake3::Hasher::new();
+    h.update(build);
+    h.update(&views.to_le_bytes());
+    h.update(&[u8::from(blocks), victory_shader::emit::VIEW_BLOCK_SHIFT as u8]);
+    *h.finalize().as_bytes()
+}
+
 /// The translation of a console shader container, from the cache when
 /// there is one, and whether it came from there.
 pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
@@ -97,8 +112,17 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
     // (`crate::shadow::copy_back_marks`).
     let options = victory_shader::emit::Options { view_marks: true };
     let translate = |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
+    let (views, blocks) = (
+        victory_shader::emit::heap_views(),
+        victory_shader::emit::view_blocks(),
+    );
     match CACHE.get() {
-        Some(cache) => cached(cache, build(), container, translate),
+        Some(cache) => cached(
+            cache,
+            &host_build(build(), views, blocks),
+            container,
+            translate,
+        ),
         None => (translate(container), false),
     }
 }
@@ -453,6 +477,14 @@ mod tests {
         assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20, 64));
         assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19, 64));
         assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 20, 32));
+        // A host with smaller view heaps has entries of its own.
+        let views = victory_shader::emit::HEAP_VIEWS;
+        assert_eq!(host_build(&k, views, false), k);
+        assert_ne!(host_build(&k, 1_000_000, true), k);
+        assert_ne!(
+            host_build(&k, 1_000_000, true),
+            host_build(&k, 1_000_000, false)
+        );
         assert_eq!(
             *build(),
             key(

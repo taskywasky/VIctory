@@ -44,7 +44,7 @@
 //!   host copy (and kind) serves every draw of a list. In programs that
 //!   use title memory (below) root SRVs and UAVs are title memory instead;
 //!   elsewhere [`HostShader::root_srvs`] and [`HostShader::root_uavs`] now
-//!   hold only the host's own tables (`VIEW_STRIDES`).
+//!   hold only the host's own tables (`VIEW_STRIDES`, `VIEW_BLOCKS`).
 //! * **Vertex fetch** (added 2026-11-23). Grand Theft Auto VI's mesh and
 //!   vertex programs fetch vertices themselves with typed-format loads
 //!   (`tbuffer_load_format_*`): the format (8_8_8_8 unorm, 16_16 snorm,
@@ -87,13 +87,28 @@
 //!   (samplers [`HEAP_SAMPLERS`] − 1): the host's heaps have at least that
 //!   many slots, those past its own null, so an index past the heap (data
 //!   still wrong; the console would read whatever memory follows its heap)
-//!   reads nothing instead of faulting the device.
+//!   reads nothing instead of faulting the device. A host that makes no
+//!   view heap that large (1,000,000 slots at most on NVIDIA) says how
+//!   large its view heaps are ([`set_view_heap`]): view indices are then
+//!   clamped below that ([`heap_views`]). Such a heap cannot hold every
+//!   slot of a title heap larger than itself, so it holds the title's
+//!   slots by blocks of 2^[`VIEW_BLOCK_SHIFT`], each wherever the host put
+//!   it ([`view_blocks`]): an index a shader takes from the resource heap
+//!   itself is the title's, clamped below [`HEAP_VIEWS`], and becomes the
+//!   host's through the view-block table (root SRV `t`[`VIEW_BLOCKS`] in
+//!   [`ROOT_CBV_SPACE`], listed in [`HostShader::root_srvs`]): dword
+//!   `index >> VIEW_BLOCK_SHIFT` plus the index within the block; a block
+//!   the heap does not hold reads null slots. Descriptor tables need
+//!   nothing: the host passes where a table lies in its own heap, as it
+//!   does for tables it makes afresh. The view-stride table and the view
+//!   addresses are read at the host's index. Translations differ by these
+//!   two values and by nothing else of the host.
 //! * **Buffer views at computed heap indices** (added 2026-11-24): a
 //!   buffer read through a descriptor the shader takes from the resource
 //!   heap itself first looks up the view-stride table (root SRV
 //!   `t`[`VIEW_STRIDES`], which then covers every index below
 //!   [`HEAP_VIEWS`], dynamic slots too); where it holds 0 (no buffer view
-//!   there) the shader reads heap index [`NULL_BUFFER_VIEW`] instead (for
+//!   there) the shader reads heap index [`null_buffer_view`] instead (for
 //!   unordered access the index below), which the host keeps a null raw
 //!   buffer SRV (UAV). The index comes from data, and a texture descriptor
 //!   read as a buffer one is a wild address (the texture's shifted 8 bits
@@ -235,9 +250,10 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use sampler::StaticSampler;
 pub use shader::{
-    HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_SPACE, NULL_BUFFER_VIEW, ROOT_CBV_SPACE, SAMPLER_SPACE,
-    USER_DATA_SPACE, VIEW_INTEGER, VIEW_MARK_NONE, VIEW_MARKS, VIEW_READS, VIEW_SIGNED, VIEW_STRIDE_BITS,
-    VIEW_STRIDES, VIEW_WRITE_BITS, VIEW_WRITES,
+    HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE,
+    VIEW_BLOCK_SHIFT, VIEW_BLOCKS, VIEW_INTEGER, VIEW_MARK_NONE, VIEW_MARKS, VIEW_READS,
+    VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES, VIEW_WRITE_BITS, VIEW_WRITES, heap_views,
+    null_buffer_view, set_view_heap, view_blocks,
 };
 
 /// The loop limit without an override: 2^20.

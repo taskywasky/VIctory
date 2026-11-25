@@ -208,6 +208,8 @@ To separate streaming time from GPU work, include
 and worker activity during loading.
 On NVIDIA, check `host wave lanes` for `split_wave64=true`. Indirect trace
 counts come from the same clamped buffer as the records used for execution.
+The `host view heap capped` line reports the adapter's descriptor limit and
+how many blocks are available for the title's views.
 
 For a startup breakpoint (`0x80000003`), run the diagnostics build with
 `VICTORY_CRASH_BREAKPOINTS=1`. Keep the console output along with the new

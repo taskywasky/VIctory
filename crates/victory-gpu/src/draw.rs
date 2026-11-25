@@ -71,8 +71,9 @@ pub(crate) struct State {
     /// Graphics, compute.
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
-    /// Tables made afresh in this list: (table, what it holds) → first
-    /// dynamic slot.
+    /// Tables made afresh in this list: (table, what its used entries hold)
+    /// → where its entry 0 would lie (the first dynamic slot less the first
+    /// used entry, [`fresh_range`]).
     fresh_tables: std::collections::HashMap<(u64, u64), u32>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list is reset or released.
@@ -677,6 +678,20 @@ impl State {
         }
         for stage in &p.stages {
             let t = stage.translated();
+            let view_addresses = if stage.view_addresses.is_some() {
+                let Some(gpu) = (self.heaps[0] != 0)
+                    .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
+                    .flatten()
+                    .and_then(|h| h.view_addresses())
+                else {
+                    once!("a shader reading a view's address dropped: no view heap");
+                    not_run("view addresses without a view heap");
+                    return false;
+                };
+                Some(gpu)
+            } else {
+                None
+            };
             self.table_failed = false;
             let made = self.tables(list, &t.used, compute);
             // A depth copy of ours made readable a texture the tables hold
@@ -765,14 +780,17 @@ impl State {
             }
             for (views, kind) in [(&stage.root_cbvs, 0), (&stage.root_srvs, 1), (&stage.root_uavs, 2)] {
                 for &(slot, param) in views {
-                    if kind == 1 && slot == victory_shader::emit::VIEW_STRIDES {
-                        // The bound view heap's stride table; without one
-                        // the shader would read an unbound root view.
+                    let blocks = slot == victory_shader::emit::VIEW_BLOCKS;
+                    if kind == 1 && (blocks || slot == victory_shader::emit::VIEW_STRIDES) {
+                        // The bound view heap's stride table, or its block
+                        // table; without one the shader would read an
+                        // unbound root view.
                         let heap = (self.heaps[0] != 0)
                             .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
                             .flatten();
-                        let Some(table) = heap.and_then(|h| h.strides()) else {
-                            once!("a shader reads view strides without a view heap: dropped");
+                        let table = heap.and_then(|h| if blocks { h.blocks() } else { h.strides() });
+                        let Some(table) = table else {
+                            once!("a shader reads view strides or blocks without a view heap: dropped");
                             not_run("view strides without a view heap");
                             return false;
                         };
@@ -810,16 +828,7 @@ impl State {
                     }
                 }
             }
-            if let Some(param) = stage.view_addresses {
-                let gpu = (self.heaps[0] != 0)
-                    .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
-                    .flatten()
-                    .and_then(|h| h.view_addresses());
-                let Some(gpu) = gpu else {
-                    once!("a shader reading a view's address dropped: no view heap");
-                    not_run("view addresses without a view heap");
-                    return false;
-                };
+            if let (Some(param), Some(gpu)) = (stage.view_addresses, view_addresses) {
                 // SAFETY: an open list; the heap's buffer lives with the heap.
                 unsafe {
                     if compute {
@@ -1179,33 +1188,57 @@ impl State {
     /// title's slots. Constant buffers there are raw views of their data
     /// (translated shaders read them so: the host wants constant buffer
     /// views 256-byte aligned, the console only 16), brought up to date at
-    /// submission like other buffer views. Returns the byte offsets of
-    /// tables made afresh in dynamic slots, by root parameter.
+    /// submission like other buffer views. Returns the byte offsets in the
+    /// host heap of tables that lie elsewhere there than in the title's
+    /// (made afresh in dynamic slots, or in blocks the host placed), by
+    /// root parameter.
     ///
     /// Within a list, the same table holding the same descriptors is made
     /// once.
     fn tables(&mut self, list: &HostList, used: &[UsedResource], compute: bool) -> Vec<(u8, u32)> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
         let mut fresh: Vec<u8> = Vec::new();
-        // Tables reaching past a host heap smaller than the title's (the
-        // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
-        // title's slots there have no host slot of their own.
+        // Each table's title slots the shader reads, first to last.
+        let mut spans: Vec<(u8, u64, u32, u32)> = Vec::new();
         for u in used.iter().filter(tables) {
-            if fresh.contains(&u.slot) {
-                continue;
-            }
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
                 continue;
             };
             let end = table + u64::from(u.table_offset_dwords) * 4;
+            let Some(index) = self.heap_of(table).and_then(|heap| heap.index(end)) else {
+                continue;
+            };
+            match spans.iter_mut().find(|s| s.0 == u.slot) {
+                Some(span) => (span.2, span.3) = (span.2.min(index), span.3.max(index)),
+                None => spans.push((u.slot, table, index, index)),
+            }
+        }
+        // Tables whose slots the host heap does not hold in one run are
+        // made afresh: those reaching past a host heap smaller than the
+        // title's, and where the host holds the title's slots by blocks
+        // (its limit, 1,000,000 views on NVIDIA) those reaching into a
+        // block without host slots or across blocks that lie apart. A
+        // table the host holds elsewhere than the title is read there.
+        let mut made = Vec::new();
+        for (slot, table, first, last) in spans {
             let Some(heap) = self.heap_of(table) else {
                 continue;
             };
-            let (Some(host), Some(index)) = (heap.host(), heap.index(end)) else {
+            let Some(host) = heap.host() else {
                 continue;
             };
-            if index >= host.count() {
-                fresh.push(u.slot);
+            match host.run(first, last) {
+                Some(at) if at == first => {}
+                Some(at) => {
+                    // The table's entry 0 lies as far below its first used
+                    // entry on the host as on the title's heap.
+                    let offset = (table - heap.start) as i64 + (i64::from(at) - i64::from(first)) * 32;
+                    match u32::try_from(offset) {
+                        Ok(offset) => made.push((slot, offset)),
+                        Err(_) => fresh.push(slot),
+                    }
+                }
+                None => fresh.push(slot),
             }
         }
         fresh.sort_unstable();
@@ -1215,7 +1248,6 @@ impl State {
                 self.table_entry(list, u, compute);
             }
         }
-        let mut made = Vec::new();
         for slot in fresh {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
@@ -1231,30 +1263,31 @@ impl State {
             let Some(host) = heap.host() else {
                 continue;
             };
-            let n = entries
-                .iter()
-                .map(|u| u.table_offset_dwords / 8 + 1)
-                .max()
-                .unwrap_or(1);
-            // The table and what its entries hold (record words).
+            // Only the entries from the first used one on get slots: those
+            // before it would take dynamic slots no shader reads, and a
+            // capped heap has few.
+            let (start, end) = fresh_range(entries.iter().map(|u| u.table_offset_dwords / 8), host.count());
+            let n = end - start;
+            // The table and what these entries hold (record words).
             let key = {
                 use std::hash::{Hash, Hasher};
                 let mut h = std::collections::hash_map::DefaultHasher::new();
-                for k in 0..n {
+                (start, end).hash(&mut h);
+                for k in start..end {
                     let at = table + u64::from(k) * 32;
                     // SAFETY: a descriptor slot in title memory.
                     unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
                 }
                 (table, h.finish())
             };
-            if let Some(&first) = self.fresh_tables.get(&key) {
+            if let Some(&base) = self.fresh_tables.get(&key) {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
                         readable(list, u, &view, true);
                     }
                 }
-                made.push((slot, first * 32));
+                made.push((slot, base * 32));
                 continue;
             }
             let Some(first) = host.dynamic(n) else {
@@ -1266,13 +1299,18 @@ impl State {
                 self.table_failed = true;
                 continue;
             };
-            self.fresh_tables.insert(key, first);
+            // Where the table's entry 0 would lie: `start` slots below the
+            // first one made (dynamic slots follow the title's, and `start`
+            // is at most their count).
+            let base = first - start;
+            self.fresh_tables.insert(key, base);
             self.dynamic
                 .push((std::ptr::from_ref(heap) as usize, first, n));
-            // The whole range: a shader may index past the entries its
-            // used-resource list names (descriptor arrays).
-            for k in 0..n {
-                let index = first + k;
+            // The whole range from the first used entry: a shader may index
+            // past the entries its used-resource list names (descriptor
+            // arrays).
+            for k in start..end {
+                let index = base + k;
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(view) => {
@@ -1289,7 +1327,7 @@ impl State {
                     }
                 }
             }
-            made.push((slot, first * 32));
+            made.push((slot, base * 32));
         }
         made
     }
@@ -1954,6 +1992,16 @@ const RECTANGLES: u32 = 17;
 const LINE_LOOP: u32 = 18;
 const QUADS: u32 = 19;
 const QUAD_STRIP: u32 = 20;
+
+/// The entries `[start, end)` of a table made afresh that get dynamic
+/// slots: from the first of the used `entries` to the last. `start` is at
+/// most `mirrored`, the heap's title slots, so the table's entry 0 keeps an
+/// index: `start` below the first slot taken, which lies at or past them.
+fn fresh_range(entries: impl Iterator<Item = u32> + Clone, mirrored: u32) -> (u32, u32) {
+    let start = entries.clone().min().unwrap_or(0).min(mirrored);
+    let end = entries.max().map_or(1, |last| last + 1).max(start + 1);
+    (start, end)
+}
 
 #[cfg(test)]
 mod tests {
@@ -2974,5 +3022,24 @@ void main(uint3 id : SV_DispatchThreadID) {
         drop(found);
         slots.make_null(0);
         assert!(shown.upgrade().is_none(), "released with the slot");
+    }
+
+    /// A table made afresh takes dynamic slots from its first used entry
+    /// on, and the offset the shader is given still leads each entry to its
+    /// slot.
+    #[test]
+    fn a_fresh_table_takes_slots_from_its_first_used_entry() {
+        assert_eq!(fresh_range([123, 120].into_iter(), 721_469), (120, 124));
+        assert_eq!(fresh_range([0, 7].into_iter(), 721_469), (0, 8));
+        assert_eq!(fresh_range(std::iter::empty(), 4), (0, 1));
+        // Entry 0 never falls below slot 0: dynamic slots start at the
+        // heap's title slots, here 4.
+        assert_eq!(fresh_range([120, 123].into_iter(), 4), (4, 124));
+        // 4 slots from dynamic slot 721,469 on, not 124; shaders index
+        // (the table's byte offset + the entry's) / 32.
+        let (first, (start, end)) = (721_469, fresh_range([120, 123].into_iter(), 721_469));
+        let offset = (first - start) * 32;
+        assert_eq!(end - start, 4);
+        assert_eq!([(offset + 120 * 32) / 32, (offset + 123 * 32) / 32], [first, first + 3]);
     }
 }

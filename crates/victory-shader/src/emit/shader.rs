@@ -24,19 +24,87 @@ pub const VIEW_STRIDE_BITS: u32 = (1 << 30) - 1;
 pub const VIEW_INTEGER: u32 = 1 << 31;
 /// With [`VIEW_INTEGER`]: a signed (`SINT`) format.
 pub const VIEW_SIGNED: u32 = 1 << 30;
+/// The root SRV slot of the host's view-block table, in [`ROOT_CBV_SPACE`]:
+/// read only by shaders translated for a host that holds the title's view
+/// slots by blocks ([`set_view_heap`]). Its dword `b` is the heap index of
+/// the first of the title's slots `b << VIEW_BLOCK_SHIFT ..`, for every `b`
+/// below [`HEAP_VIEWS`]` >> VIEW_BLOCK_SHIFT`.
+pub const VIEW_BLOCKS: u8 = 254;
+/// Title view slots come in blocks of `1 << VIEW_BLOCK_SHIFT` on such a
+/// host: a block's slots follow each other in the host's heap, in the
+/// title's order, wherever the block lies.
+pub const VIEW_BLOCK_SHIFT: u32 = 10;
 /// Where the title-memory page table is bound: `t0` (a raw root SRV) in
 /// this space (see `emit` "Title memory").
 pub const MEMORY_SPACE: u32 = 2;
 /// Heap indices are clamped below these (views, samplers): the host's heaps
 /// are at least this large, the slots past their own null (`emit`, "Heap
-/// indices").
+/// indices"). Views: on a host that makes view heaps this large; else below
+/// [`heap_views`].
 pub const HEAP_VIEWS: u32 = 1 << 21;
 pub const HEAP_SAMPLERS: u32 = 2048;
+
+/// What translations assume of the host's view heaps: their slots, and
+/// whether they hold the title's slots by blocks ([`set_view_heap`]).
+static VIEW_HEAP: [std::sync::atomic::AtomicU32; 2] = [
+    std::sync::atomic::AtomicU32::new(HEAP_VIEWS),
+    std::sync::atomic::AtomicU32::new(0),
+];
+
+#[cfg(test)]
+thread_local! {
+    /// [`VIEW_HEAP`] for the translations of one test's thread, so that a
+    /// test translating for another kind of host does not change what the
+    /// tests beside it get.
+    pub(crate) static TEST_VIEW_HEAP: std::cell::Cell<Option<(u32, bool)>> = const { std::cell::Cell::new(None) };
+}
+
+fn view_heap() -> (u32, bool) {
+    #[cfg(test)]
+    if let Some(heap) = TEST_VIEW_HEAP.get() {
+        return heap;
+    }
+    let relaxed = std::sync::atomic::Ordering::Relaxed;
+    (VIEW_HEAP[0].load(relaxed), VIEW_HEAP[1].load(relaxed) != 0)
+}
+
+/// The slots of the host's view heaps, which view heap indices are clamped
+/// below: [`HEAP_VIEWS`] unless the host said otherwise ([`set_view_heap`]).
+pub fn heap_views() -> u32 {
+    view_heap().0
+}
+
+/// Whether the host's view heaps hold the title's slots by blocks: an
+/// index a shader takes from the resource heap itself is the title's, and
+/// goes through the view-block table ([`VIEW_BLOCKS`]) to the host's.
+/// False unless the host said otherwise ([`set_view_heap`]).
+pub fn view_blocks() -> bool {
+    view_heap().1
+}
+
+/// For a host whose shader-visible view heaps are smaller than
+/// [`HEAP_VIEWS`] (1,000,000 slots on NVIDIA; an index past a heap is
+/// undefined there, a removed device in practice): every view heap has
+/// `views` slots, the last three null as below. Such a heap has no room for
+/// every slot of a title heap that large beside the host's own, so with
+/// `blocks` it holds the title's slots by blocks, each wherever it fits
+/// ([`VIEW_BLOCKS`]). Set before the first translation. The values are part
+/// of the translation, so a shader cache must key on them (`victory-gpu`'s
+/// does).
+pub fn set_view_heap(views: u32, blocks: bool) {
+    let relaxed = std::sync::atomic::Ordering::Relaxed;
+    VIEW_HEAP[0].store(views.clamp(4, HEAP_VIEWS), relaxed);
+    VIEW_HEAP[1].store(u32::from(blocks), relaxed);
+}
+
 /// The heap index of the host's null raw buffer view (the null raw
 /// unordered access view at the index below), read instead of a slot that
 /// holds no buffer view where a shader reads one at an index it computes
-/// (`emit`, "Buffer views at computed heap indices").
-pub const NULL_BUFFER_VIEW: u32 = HEAP_VIEWS - 2;
+/// (`emit`, "Buffer views at computed heap indices"): two below the end of
+/// the host's view heaps, whose last slot stays null.
+pub fn null_buffer_view() -> u32 {
+    heap_views() - 2
+}
 /// The view-mark table's register: `t2` (a raw root SRV) in
 /// [`MEMORY_SPACE`] (`emit`, "Write marks").
 pub const VIEW_MARKS: u32 = 2;
@@ -542,7 +610,7 @@ impl Shader {
         self.nonuniform_handles += u32::from(nonuniform);
         // An index past the host's heap faults the device (a console shader
         // reads whatever memory follows its heap): the last slot instead.
-        let last = self.m.i32(if sampler { HEAP_SAMPLERS } else { HEAP_VIEWS } - 1);
+        let last = self.m.i32(if sampler { HEAP_SAMPLERS } else { heap_views() } - 1);
         let over = self.m.cmp(block, pred::IUGT, index, last);
         let index = self.m.select(block, over, last, index);
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));

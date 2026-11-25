@@ -631,7 +631,7 @@ fn writes_through_views_mark_their_pages() {
 
 /// Reads of texture views the program takes from the resource heap itself
 /// mark their heap index (`emit`, "Read marks"): an `image_load` of the view
-/// at heap byte offset 32 (index 1) sets exactly the bit one past
+/// at title byte offset 32 (index 1) marks the remapped host slot in
 /// [`super::VIEW_READS`]. The same read through a table marks nothing (a
 /// table read makes its slot on the host).
 #[test]
@@ -698,7 +698,10 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
         0,
     );
     assert!(!table.view_marks, "a table read marks nothing");
+    super::shader::TEST_VIEW_HEAP.set(Some((1_000_000, true)));
     let l = lower_with(RootType::ResourceHeap, Vec::new(), 32);
+    super::shader::TEST_VIEW_HEAP.set(None);
+    assert_eq!(l.root_srvs, [super::VIEW_BLOCKS]);
     assert!(l.view_marks && l.heap, "a heap-direct read is marked");
     let shader = HostShader {
         stage: HwStage::Cs,
@@ -722,8 +725,12 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let words = (super::VIEW_READS + 64) / 32;
+    let base = 1 << super::VIEW_BLOCK_SHIFT;
+    let words = (super::VIEW_READS + base + 64) / 32;
     let texel = [[0.5f32; 4]];
+    let mut views = Vec::with_capacity(base as usize + 2);
+    views.resize_with(base as usize + 1, || View::Pair);
+    views.push(View::Texture(1, 1, &texel));
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
         let Ok(host) = Host::new(warp) else {
@@ -740,10 +747,11 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
                 &Dispatch {
                     roots: vec![
                         (0, Root::Constants(ud)),
-                        (1, Root::View { srv: true, data: vec![super::VIEW_MARK_NONE; 4] }),
-                        (2, Root::Uav(words)),
+                        (1, Root::View { srv: true, data: vec![base] }),
+                        (2, Root::View { srv: true, data: vec![super::VIEW_MARK_NONE; 4] }),
+                        (3, Root::Uav(words)),
                     ],
-                    views: &[View::Texture(1, 1, &texel), View::Texture(1, 1, &texel)],
+                    views: &views,
                     samplers: &[],
                     groups: [1, 1, 1],
                 },
@@ -751,7 +759,7 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
             .unwrap_or_else(|e| panic!("{label}: {e}"));
         let bits = &out[0];
         let marked: Vec<usize> = (0..bits.len() * 32).filter(|&b| bits[b / 32] >> (b % 32) & 1 != 0).collect();
-        assert_eq!(marked, [super::VIEW_READS as usize + 1], "{label}: the slot read");
+        assert_eq!(marked, [(super::VIEW_READS + base + 1) as usize], "{label}: the mapped slot");
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");

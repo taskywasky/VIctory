@@ -532,6 +532,29 @@ impl Host {
         unsafe { device.CreatePipelineState(&desc) }.map_err(err)
     }
 
+    /// The slots a shader-visible view heap of this device may have, of
+    /// those translated shaders index by default ([`super::HEAP_VIEWS`]):
+    /// that many, or the 1,000,000 every device makes (resource binding
+    /// tiers 1 and 2; NVIDIA makes no larger one on tier 3 either). What
+    /// [`super::set_view_heap`] is told.
+    pub fn view_heap_limit(&self) -> u32 {
+        // SAFETY: plain heap creation; the heap is dropped at once.
+        let made = unsafe {
+            self.device
+                .CreateDescriptorHeap::<ID3D12DescriptorHeap>(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: super::HEAP_VIEWS,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+        };
+        if made.is_ok() {
+            super::HEAP_VIEWS
+        } else {
+            1_000_000
+        }
+    }
+
     /// Whether this device fuses DXIL `FMad`, which the lowering emits for
     /// the console's fused `v_fma_f32`/`v_fmac_f32`/`v_fma_mix*`: where it
     /// does not, their results can differ in kind (NaN where an overflowing
@@ -1270,8 +1293,8 @@ pub enum View<'a> {
     NullPair,
     /// The second slot of a [`View::Memory`] or [`View::NullPair`].
     Pair,
-    /// Last in the heap, which then has [`super::HEAP_VIEWS`] slots: the
-    /// host's null raw buffer SRV at [`super::NULL_BUFFER_VIEW`] and UAV
+    /// Last in the heap, which then has [`super::heap_views`] slots: the
+    /// host's null raw buffer SRV at [`super::null_buffer_view`] and UAV
     /// below it.
     NullBuffers,
 }
@@ -1450,7 +1473,7 @@ impl Host {
                 Ok(b)
             };
             let slots = match d.views.last() {
-                Some(View::NullBuffers) => super::HEAP_VIEWS as usize,
+                Some(View::NullBuffers) => super::heap_views() as usize,
                 _ => d.views.len(),
             };
             let views = heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, slots)?;
@@ -1783,7 +1806,7 @@ impl Host {
                     }
                     View::Pair => {}
                     View::NullBuffers => {
-                        let null = super::NULL_BUFFER_VIEW as usize;
+                        let null = super::null_buffer_view() as usize;
                         let (mut srv_at, mut uav_at) = (at, at);
                         srv_at.ptr += (null - i) * view_size;
                         uav_at.ptr += (null - 1 - i) * view_size;
