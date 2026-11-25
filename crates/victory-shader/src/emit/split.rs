@@ -11,24 +11,25 @@
 //! finds those blocks; elsewhere each half works alone, over its own 32
 //! lanes.
 
-use crate::structure::{Atom, LaneExit, Structured};
+use crate::structure::{LaneExit, Structured};
 
 /// Per block: whether every thread of the group that starts the program
 /// reaches it, together and as often as the others.
 ///
-/// A block is divergent when it lies in the region a divergent branch
-/// controls: reachable from the branch before its immediate
-/// post-dominator. That covers both sides of a lane `if` and the body of a
-/// loop with a lane exit. A branch is divergent unless its condition is
-/// the same in every thread of the group: with one console wave per group
-/// (`one_wave`), a condition over wave-uniform values ([`Atom::Uniform`]);
-/// with several waves, none (scalar values may differ between waves).
-pub(crate) fn convergent(st: &Structured, one_wave: bool) -> Vec<bool> {
-    let n = st.exits.len();
-    let succs: Vec<Vec<usize>> = st
+/// A scalar branch can differ between host halves after a half-local read.
+/// Model watchdog returns as exits too: threads that return cannot reach
+/// a later barrier, even if that block post-dominated the original loop.
+pub(crate) fn convergent(
+    st: &Structured,
+    watchdog_return: impl Fn(usize, usize) -> bool,
+) -> Vec<bool> {
+    let exit = st.exits.len();
+    let mut succs: Vec<Vec<usize>> = st
         .exits
         .iter()
-        .map(|e| match *e {
+        .enumerate()
+        .map(|(b, e)| match *e {
+            LaneExit::Jump(t) if watchdog_return(b, t) => vec![t, exit],
             LaneExit::Jump(t) => vec![t],
             LaneExit::Branch {
                 taken, not_taken, ..
@@ -36,27 +37,22 @@ pub(crate) fn convergent(st: &Structured, one_wave: bool) -> Vec<bool> {
             LaneExit::End | LaneExit::Indirect => Vec::new(),
         })
         .collect();
-    let ipdom = post_dominators(&succs);
+    succs.push(Vec::new());
+    let mut out = reconverged(&succs);
+    out.pop();
+    out
+}
+
+fn reconverged(succs: &[Vec<usize>]) -> Vec<bool> {
+    let n = succs.len();
+    let ipdom = post_dominators(succs);
     let mut out = vec![true; n];
-    for (d, e) in st.exits.iter().enumerate() {
-        let divergent = match *e {
-            LaneExit::Branch { when, .. } => {
-                !one_wave
-                    || !st
-                        .bools
-                        .support(when)
-                        .iter()
-                        .all(|a| matches!(a, Atom::Uniform(_)))
-            }
-            // Where each lane jumps is its own.
-            LaneExit::Indirect => true,
-            _ => false,
-        };
-        if !divergent {
+    for (d, edges) in succs.iter().enumerate() {
+        if edges.len() < 2 {
             continue;
         }
         let stop = ipdom[d];
-        let mut work: Vec<usize> = succs[d].clone();
+        let mut work = edges.clone();
         let mut seen = vec![false; n];
         while let Some(b) = work.pop() {
             if Some(b) == stop || seen[b] {
@@ -139,5 +135,12 @@ mod tests {
         let succs = vec![vec![1, 2], vec![3], vec![3], vec![3, 4], vec![]];
         let ipdom = post_dominators(&succs);
         assert_eq!(ipdom, vec![Some(3), Some(3), Some(3), Some(4), None]);
+    }
+
+    #[test]
+    fn watchdog_return_prevents_reconvergence_after_the_loop() {
+        // 0 hands control to a loop; 2 can take its watchdog exit at 4.
+        let graph = [vec![1], vec![2, 3], vec![1, 4], vec![], vec![]];
+        assert_eq!(super::reconverged(&graph), [true, false, false, false, false]);
     }
 }

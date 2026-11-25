@@ -119,12 +119,12 @@ lane indices and masks stay the console's. DPP, `ds_swizzle` and
 and whole-wave reductions and prefix sums combine the
 two halves' parts through a few group-shared dwords between thread-group
 barriers, which gives the console's results exactly. A barrier needs the
-whole group, so that is only possible where every thread runs together:
-with one console wave per group, outside any lane branch's region; with
-several, before the first branch. Elsewhere each half works over its own
-32 lanes, as pixel and vertex programs do over the host's wave (counts,
-first lanes, prefixes and reductions of the half, console lane numbers
-kept): right for aggregated atomics and scalarization loops, wrong where
+whole group, so that is only possible where every thread runs together.
+Split lowering treats scalar branches as potentially divergent, since
+prior half-local operations can disagree, and accounts for loop-watchdog
+returns. In divergent regions each half works over its own 32 lanes
+(counts, first lanes, prefixes and reductions of the half, console lane
+numbers kept): right for aggregated atomics and scalarization loops, wrong where
 the code needs one value for all 64 lanes. `v_readfirstlane` of a value
 that is the same in every lane needs neither.
 One-wave groups also get barriers after LDS writes and at joins, which the

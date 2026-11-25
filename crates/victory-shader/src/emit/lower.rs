@@ -601,7 +601,7 @@ impl<'a> Lower<'a> {
                 let threads = cs.threads.iter().product::<u32>();
                 s.wave_size = Some(32);
                 split = Some(Split {
-                    convergent: super::split::convergent(x.st, one_wave),
+                    convergent: Vec::new(),
                     base: s.lds_dwords,
                     threads,
                     lds_writes: one_wave && insts().any(lds_write),
@@ -1405,6 +1405,11 @@ impl<'a> Lower<'a> {
                 let phi = self.s.m.phi(blk, self.s.t.i32);
                 self.counters.insert(b, (phi, Vec::new()));
             }
+        }
+        if let Some(split) = &mut self.split {
+            split.convergent = super::split::convergent(self.x.st, |from, to| {
+                self.counters.contains_key(&to) && self.rpo[to] <= self.rpo[from]
+            });
         }
         self.cur = self.s.entry;
         // D3D12's thread-group shared memory: 32 KiB.
