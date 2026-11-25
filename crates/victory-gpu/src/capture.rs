@@ -423,17 +423,15 @@ fn peek(when: &str) {
     }
 }
 
-/// In a listed frame: copies an indirect execution's records (`args`:
-/// buffer, offset; in the indirect-argument state) and its count (in the
-/// unordered-access state unless in the same buffer) to readback memory,
-/// logged once the list has run: how many records ask for work, and the
-/// first ones.
+/// Copies the clamped records and optional trailing count from the list's
+/// indirect-argument buffer to readback memory, logged once the list runs.
 pub(crate) fn read_indirect(
     list: &crate::host::HostList,
-    args: (&ID3D12Resource, u64),
-    count: Option<(&ID3D12Resource, u64)>,
+    args: &ID3D12Resource,
+    counted: bool,
     (kind, stride, max): (u32, u32, u32),
     name: String,
+    always: bool,
 ) {
     struct Readback(ID3D12Resource);
     // SAFETY: D3D12 objects are free-threaded.
@@ -441,10 +439,11 @@ pub(crate) fn read_indirect(
     // SAFETY: as above.
     unsafe impl Sync for Readback {}
     let Some(host) = crate::host::host() else { return };
-    let len = u64::from(stride) * u64::from(max.max(1));
+    let len = u64::from(stride) * u64::from(max);
+    let bytes = len + if counted { 4 } else { 0 };
     let desc = D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-        Width: len + 4,
+        Width: bytes,
         Height: 1,
         DepthOrArraySize: 1,
         MipLevels: 1,
@@ -456,7 +455,6 @@ pub(crate) fn read_indirect(
     let mut buffer: Option<ID3D12Resource> = None;
     let l = &list.list;
     use crate::host::transition;
-    use windows::core::Interface;
     let (arg_state, copy) = (D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
     // SAFETY: plain creation; an open list and live buffers in the states
     // named, put back after the copies.
@@ -469,33 +467,22 @@ pub(crate) fn read_indirect(
             return;
         }
         let Some(buffer) = buffer else { return };
-        l.ResourceBarrier(&[transition(args.0, arg_state, copy)]);
-        l.CopyBufferRegion(&buffer, 0, args.0, args.1, len);
-        if let Some((c, at)) = count {
-            let same = c.as_raw() == args.0.as_raw();
-            let state = if same { copy } else { D3D12_RESOURCE_STATE_UNORDERED_ACCESS };
-            if !same {
-                l.ResourceBarrier(&[transition(c, state, copy)]);
-            }
-            l.CopyBufferRegion(&buffer, len, c, at, 4);
-            if !same {
-                l.ResourceBarrier(&[transition(c, copy, state)]);
-            }
-        }
-        l.ResourceBarrier(&[transition(args.0, copy, arg_state)]);
+        l.ResourceBarrier(&[transition(args, arg_state, copy)]);
+        l.CopyBufferRegion(&buffer, 0, args, 0, bytes);
+        l.ResourceBarrier(&[transition(args, copy, arg_state)]);
         list.keep(&buffer);
         let buffer = Readback(buffer);
-        let counted = count.is_some();
         list.defer_after(move || {
             // Recorded ahead: logged if the frame running it is listed.
-            if !listed(crate::queue::presented() + 1) {
+            let frame = crate::queue::presented() + 1;
+            if !always && !listed(frame) {
                 return;
             }
             let mut data = std::ptr::null_mut();
             if buffer.0.Map(0, None, Some(&mut data)).is_err() {
                 return;
             }
-            let words = std::slice::from_raw_parts(data.cast::<u32>(), (len as usize + 4) / 4);
+            let words = std::slice::from_raw_parts(data.cast::<u32>(), bytes as usize / 4);
             let n = counted.then(|| words[len as usize / 4]);
             let records = n.unwrap_or(max).min(max) as usize;
             let step = stride as usize / 4;
@@ -513,7 +500,7 @@ pub(crate) fn read_indirect(
             let shown: Vec<&[u32]> = (0..records.min(4)).map(first).collect();
             tracing::info!(
                 target: "victory_gpu::trace",
-                "indirect kind {kind} max {max} count {n:?}: {busy} of {records} records with work, {total} in all; first {shown:?} {name}"
+                "indirect kind {kind} max {max} count {n:?}: {busy} of {records} records with work, {total} in all; first {shown:?} {name} frame {frame}"
             );
             buffer.0.Unmap(0, None);
         });
@@ -628,12 +615,20 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
     type Decode = Box<dyn Fn(&[u8]) -> [f32; 3]>;
     let (n, decode): (usize, Decode) = match format {
         27..=32 => {
+            // The PNG drops alpha: its range and how many texels have each
+            // channel zero are logged.
+            let (mut low, mut high, mut zero) = ([255u8; 4], [0u8; 4], [0usize; 4]);
             for y in 0..h {
                 for x in 0..w {
                     let p = px(x, y, 4);
+                    for c in 0..4 {
+                        (low[c], high[c]) = (low[c].min(p[c]), high[c].max(p[c]));
+                        zero[c] += usize::from(p[c] == 0);
+                    }
                     out.extend([p[0], p[1], p[2], 255]);
                 }
             }
+            tracing::info!(format, ?low, ?high, ?zero, texels = w * h, "target values (8-bit, RGBA)");
             return Some(out);
         }
         // B8G8R8A8 and B8G8R8X8 (89 is R10G10B10_XR_BIAS_A2, below).
@@ -747,20 +742,29 @@ pub(crate) fn probe(
         Type: D3D12_HEAP_TYPE_READBACK,
         ..Default::default()
     };
-    let mut buffer: Option<ID3D12Resource> = None;
-    // SAFETY: plain creation; an open list; locations naming live resources.
-    unsafe {
-        device
-            .CreateCommittedResource(
-                &heap,
-                D3D12_HEAP_FLAG_NONE,
-                &desc,
-                D3D12_RESOURCE_STATE_COPY_DEST,
-                None,
-                &mut buffer,
-            )
+    // One buffer for every present: each is waited for before the next
+    // (made and released per present, it cost a kernel call per frame).
+    static BUFFER: std::sync::OnceLock<Option<ID3D12Resource>> = std::sync::OnceLock::new();
+    let buffer = BUFFER
+        .get_or_init(|| {
+            let mut buffer: Option<ID3D12Resource> = None;
+            // SAFETY: plain creation.
+            unsafe {
+                device.CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut buffer,
+                )
+            }
             .ok()?;
-        let buffer = buffer?;
+            buffer
+        })
+        .clone()?;
+    // SAFETY: an open list; locations naming live resources.
+    unsafe {
         for i in 0..GRID * GRID {
             let (x, y) = (
                 (2 * (i % GRID) + 1) * d.Width as u32 / (2 * GRID),

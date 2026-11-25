@@ -1255,6 +1255,9 @@ pub enum View<'a> {
     Uint2TextureUav(u32, u32),
     /// A typed RGBA16F buffer UAV of this many elements, zeroed.
     HalfUav(u32),
+    /// A typed buffer UAV in this format, of this many elements of this many
+    /// bytes, zeroed.
+    TypedUav(DXGI_FORMAT, u32, u32),
     /// A constant buffer of these dwords.
     Cbv(&'a [u32]),
     /// A buffer SRV over these dwords.
@@ -1271,6 +1274,34 @@ pub enum View<'a> {
     /// host's null raw buffer SRV at [`super::NULL_BUFFER_VIEW`] and UAV
     /// below it.
     NullBuffers,
+}
+
+/// The host's view-stride table (`t`[`super::VIEW_STRIDES`]) for a view
+/// heap of `views`, as `victory_gpu` fills it: per slot the element size of
+/// a buffer view (4 for raw ones), with [`super::VIEW_INTEGER`] (and
+/// [`super::VIEW_SIGNED`]) for typed views of integer formats; 0 elsewhere.
+#[cfg(test)]
+pub fn view_strides(views: &[View]) -> Vec<u32> {
+    let kind = |f: DXGI_FORMAT| match f {
+        DXGI_FORMAT_R32G32B32A32_UINT | DXGI_FORMAT_R16G16B16A16_UINT | DXGI_FORMAT_R32G32_UINT
+        | DXGI_FORMAT_R10G10B10A2_UINT | DXGI_FORMAT_R8G8B8A8_UINT | DXGI_FORMAT_R16G16_UINT
+        | DXGI_FORMAT_R32_UINT | DXGI_FORMAT_R8G8_UINT | DXGI_FORMAT_R16_UINT | DXGI_FORMAT_R8_UINT => super::VIEW_INTEGER,
+        DXGI_FORMAT_R32G32B32A32_SINT | DXGI_FORMAT_R16G16B16A16_SINT | DXGI_FORMAT_R32G32_SINT
+        | DXGI_FORMAT_R8G8B8A8_SINT | DXGI_FORMAT_R16G16_SINT | DXGI_FORMAT_R32_SINT
+        | DXGI_FORMAT_R8G8_SINT | DXGI_FORMAT_R16_SINT | DXGI_FORMAT_R8_SINT => super::VIEW_INTEGER | super::VIEW_SIGNED,
+        _ => 0,
+    };
+    views
+        .iter()
+        .map(|v| match *v {
+            View::Buffer { stride: Stride::Raw, .. } | View::RawUav(_) => 4,
+            View::Buffer { stride: Stride::Typed, .. } => 16,
+            View::Buffer { stride: Stride::Structured(n), .. } => n,
+            View::Buffer { stride: Stride::Format(f, n), .. } | View::TypedUav(f, _, n) => n | kind(f),
+            View::HalfUav(_) => 8,
+            _ => 0,
+        })
+        .collect()
 }
 
 /// How [`View::Buffer`] is viewed.
@@ -1559,7 +1590,7 @@ impl Host {
                         dev.CreateShaderResourceView(&tex, None, at);
                         keep.push(tex);
                     }
-                    View::RawUav(_) | View::HalfUav(_) => {
+                    View::RawUav(_) | View::HalfUav(_) | View::TypedUav(..) => {
                         // (dwords, format, elements, flags)
                         let (n, format, elements, flags) = match *v {
                             View::HalfUav(e) => (
@@ -1568,6 +1599,9 @@ impl Host {
                                 e,
                                 D3D12_BUFFER_UAV_FLAG_NONE,
                             ),
+                            View::TypedUav(format, e, bytes) => {
+                                ((e * bytes).div_ceil(4), format, e, D3D12_BUFFER_UAV_FLAG_NONE)
+                            }
                             View::RawUav(n) => {
                                 (n, DXGI_FORMAT_R32_TYPELESS, n, D3D12_BUFFER_UAV_FLAG_RAW)
                             }
