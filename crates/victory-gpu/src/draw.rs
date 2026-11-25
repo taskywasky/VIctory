@@ -1530,6 +1530,9 @@ impl State {
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
+        if max == 0 {
+            return true;
+        }
         // Skip before the argument clamp can mutate the indirect buffer.
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
@@ -1563,7 +1566,7 @@ impl State {
             why("no host pipeline");
             return false;
         }
-        let len = u64::from(stride) * u64::from(max.max(1));
+        let len = u64::from(stride) * u64::from(max);
         let Some(args) = crate::shadow::find(arguments, len) else {
             why("arguments outside title buffers");
             return false;
@@ -1589,8 +1592,11 @@ impl State {
         if let Some((s, at)) = &counter {
             s.refresh(list, *at, 4);
         }
+        let count_buffer = counter.as_ref().map(|(s, at)| (&s.buffer, s.gpu(*at)));
         // Bounded first: the clamp binds a compute pipeline of its own.
-        if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
+        if !crate::indirect::bound(
+            list, &args.buffer, args.gpu(arguments), count_buffer, (kind, stride, max),
+        ) {
             why("not bounded (no clamp, or arguments not 4-byte aligned)");
             return false;
         }
@@ -1611,7 +1617,7 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &args.buffer);
+            crate::indirect::done(list, &args.buffer, count_buffer.map(|(buffer, _)| buffer));
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => {
@@ -1650,7 +1656,7 @@ impl State {
             let name = crate::pipeline::shaders_of(pipeline);
             crate::capture::read_indirect(list, (&args.buffer, args.offset(arguments)), count, (kind, stride, max), name);
         }
-        crate::indirect::done(list, &args.buffer);
+        crate::indirect::done(list, &args.buffer, count_buffer.map(|(buffer, _)| buffer));
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {

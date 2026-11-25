@@ -5,6 +5,7 @@
 //! host resets the display driver. So every record is clamped on the GPU,
 //! just before its execution, by a compute shader of ours (HLSL compiled by
 //! the system's compiler; a 5.1 shader with its root signature inside).
+//! A counted call clamps only the records the GPU will execute.
 //!
 //! Each list also has a budget (2^27 vertex instances or threads, groups
 //! counted as 64 threads, mesh groups as 128): records past it run empty,
@@ -24,12 +25,13 @@ use windows::core::s;
 use crate::host::{HostList, host, transition};
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=4, b0), UAV(u0), UAV(u1)"
-cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint unused; };
+#define RS "RootConstants(num32BitConstants=4, b0), UAV(u0), UAV(u1), UAV(u2)"
+cbuffer Record : register(b0) { uint kind; uint stride; uint maxRecords; uint countOffset; };
 RWByteAddressBuffer args : register(u0);
 // The list's work so far (vertex instances, threads): past the budget,
 // records run empty.
 RWByteAddressBuffer budget : register(u1);
+RWByteAddressBuffer counter : register(u2);
 static const uint BUDGET = 1u << 27;
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 20;
@@ -62,6 +64,7 @@ uint clamped(uint at) {
 // A record past the budget (no cost reaches it).
 static const uint PAST = 0xffffffffu;
 groupshared uint costs[64];
+groupshared uint activeRecords;
 // One group walks the records in tiles of 64: every lane clamps its own
 // record, then the first lane charges the tile's records in order. No
 // other group shares the budget: a shared add wraps once enough records
@@ -69,7 +72,15 @@ groupshared uint costs[64];
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint lane : SV_GroupIndex) {
+    uint records = maxRecords;
     uint left = 0;
+    if (countOffset < 16) {
+        if (lane == 0) {
+            activeRecords = min(records, counter.Load(countOffset));
+        }
+        GroupMemoryBarrierWithGroupSync();
+        records = activeRecords;
+    }
     if (lane == 0) {
         left = BUDGET - min(budget.Load(0), BUDGET);
     }
@@ -83,7 +94,7 @@ void main(uint lane : SV_GroupIndex) {
         costs[lane] = cost;
         GroupMemoryBarrierWithGroupSync();
         if (lane == 0) {
-            for (uint i = 0; i < 64; i++) {
+            for (uint i = 0; i < min(64u, records - tile * 64); i++) {
                 if (costs[i] > left) {
                     // The first record that does not fit takes what is
                     // left, so those after it run empty too.
@@ -185,16 +196,21 @@ pub(crate) fn bound(
     list: &HostList,
     buffer: &ID3D12Resource,
     gpu: u64,
+    count: Option<(&ID3D12Resource, u64)>,
     (kind, stride, records): (u32, u32, u32),
 ) -> bool {
     let (Some(c), Some(budget)) = (clamp(), list.budget()) else {
         return false;
     };
-    if !gpu.is_multiple_of(4) || !stride.is_multiple_of(4) {
+    if !gpu.is_multiple_of(4)
+        || !stride.is_multiple_of(4)
+        || count.is_some_and(|(_, at)| !at.is_multiple_of(4))
+    {
         return false;
     }
     let l = &list.list;
-    let constants = [kind, stride, records, 0];
+    let (counter, count_offset) = count.map_or((budget, 16), |(_, at)| (at & !15, (at & 15) as u32));
+    let constants = [kind, stride, records, count_offset];
     // SAFETY: an open list; our root signature, pipeline and a live buffer
     // the caller's list holds.
     unsafe {
@@ -205,31 +221,49 @@ pub(crate) fn bound(
         l.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
         l.SetComputeRootUnorderedAccessView(1, gpu);
         l.SetComputeRootUnorderedAccessView(2, budget);
-        // One group walks every record.
-        l.Dispatch(records.min(1), 1, 1);
-        l.ResourceBarrier(&[
-            uav_barrier(),
-            transition(
-                buffer,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-            ),
-        ]);
+        l.SetComputeRootUnorderedAccessView(3, counter);
+        l.Dispatch(1, 1, 1);
+        l.ResourceBarrier(&[uav_barrier()]);
     }
+    argument_state(
+        list,
+        buffer,
+        count.map(|(buffer, _)| buffer),
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+    );
     true
 }
 
 /// After the execution: the buffer back to unordered access, where the
 /// title's passes keep using it.
-pub(crate) fn done(list: &HostList, buffer: &ID3D12Resource) {
-    // SAFETY: an open list and a live buffer.
+pub(crate) fn done(list: &HostList, buffer: &ID3D12Resource, count: Option<&ID3D12Resource>) {
+    argument_state(
+        list,
+        buffer,
+        count,
+        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+    );
+}
+
+fn argument_state(
+    list: &HostList,
+    buffer: &ID3D12Resource,
+    count: Option<&ID3D12Resource>,
+    from: D3D12_RESOURCE_STATES,
+    to: D3D12_RESOURCE_STATES,
+) {
+    // SAFETY: an open list and live resources; a shared argument/count
+    // buffer needs just one transition.
+    let args = transition(buffer, from, to);
     unsafe {
-        list.list.ResourceBarrier(&[transition(
-            buffer,
-            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-        )])
-    };
+        if let Some(count) = count.filter(|&count| count != buffer) {
+            list.list.ResourceBarrier(&[args, transition(count, from, to)]);
+        } else {
+            list.list.ResourceBarrier(&[args]);
+        }
+    }
 }
 
 fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
@@ -278,8 +312,8 @@ mod tests {
             }
             let gpu = buffer.GetGPUVirtualAddress();
             for _ in 0..calls {
-                assert!(super::bound(&list, &buffer, gpu, spec));
-                super::done(&list, &buffer);
+                assert!(super::bound(&list, &buffer, gpu, None, spec));
+                super::done(&list, &buffer, None);
             }
             list.close();
             host.execute(&[&list]);
@@ -288,6 +322,36 @@ mod tests {
             }
             let first = |i: usize| data.add(i * per).read_volatile();
             Some((0..records as usize).map(first).collect())
+        }
+    }
+
+    #[test]
+    fn counted_calls_leave_inactive_records_and_budget_intact() {
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        let (args, data) = host.shared_buffer(144).unwrap();
+        let (counter, count_data) = host.shared_buffer(8).unwrap();
+        let list = host.new_list().unwrap();
+        // SAFETY: mapped buffers are written before execution and read after it.
+        unsafe {
+            let data = data.cast::<u32>();
+            for at in 0..32 {
+                data.add(at).write_volatile(u32::MAX);
+            }
+            count_data.cast::<u32>().add(1).write_volatile(0);
+            data.add(33).write_volatile(2);
+            let gpu = args.GetGPUVirtualAddress();
+            for (counter, at) in [(&counter, counter.GetGPUVirtualAddress() + 4), (&args, gpu + 132)] {
+                assert!(super::bound(&list, &args, gpu, Some((counter, at)), (0, 16, 8)));
+                super::done(&list, &args, Some(counter));
+            }
+            list.close();
+            host.execute(&[&list]);
+            for record in 0..8 {
+                let expected = if record < 2 { 1 << 24 } else { u32::MAX };
+                assert_eq!(data.add(record * 4).read_volatile(), expected, "record {record}");
+            }
         }
     }
 

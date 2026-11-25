@@ -89,6 +89,10 @@ compiles none of those either; the library belongs to the GPU and driver it
 was made on. Run again, it skips what is there in seconds; stopped
 early, it keeps what it made.
 
+If world loading drags, prebuild both caches before timing it. Run from
+the same cache directory on the same GPU and driver; the loading screen
+still has to stream the title's data.
+
 Upscaling (Series S mode): the title upscales with AMD FidelityFX. To run
 it with the PC build on your GPU instead of the console build, get the
 [FidelityFX SDK](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK)
@@ -194,6 +198,12 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 
 Every build appends unhandled exceptions, panics, and host GPU failures to
 `crashes.log` in the title's data folder.
+
+For a crash at world entry, run the diagnostics build with
+`VICTORY_D3D12_DRED=1` and keep the device-removed reason, breadcrumbs,
+and `crashes.log`. To separate streaming time from GPU work, include
+`victory_hle::modules::dstorage=debug` in `VICTORY_LOG` to log throughput
+and worker activity during loading.
 
 For a startup breakpoint (`0x80000003`), run the diagnostics build with
 `VICTORY_CRASH_BREAKPOINTS=1`. Keep the console output along with the new
