@@ -43,6 +43,42 @@ pub(crate) fn convergent(
     out
 }
 
+/// The two halves may run different arms of a region at the same time.
+/// Multiple reads are safe; with a write we cannot order another access
+/// without a group barrier, and cannot put one inside the region.
+pub(crate) fn unfenced_lds(
+    p: &crate::ir::Program,
+    order: &[usize],
+    uniform: &[bool],
+    access: impl Fn(&crate::ir::Inst) -> bool,
+    write: impl Fn(&crate::ir::Inst) -> bool,
+) -> Option<usize> {
+    let mut seen = vec![usize::MAX; p.blocks.len()];
+    for &root in order {
+        if !uniform[root] {
+            continue;
+        }
+        let mut work = p.blocks[root].exit.successors();
+        let (mut read, mut written) = (false, false);
+        while let Some(b) = work.pop() {
+            if uniform[b] || seen[b] == root {
+                continue;
+            }
+            seen[b] = root;
+            for inst in p.blocks[b].insts.iter().filter(|i| access(i)) {
+                let writes = write(inst);
+                if written || read && writes {
+                    return Some(inst.machine.offset);
+                }
+                written |= writes;
+                read |= !writes;
+            }
+            work.extend(p.blocks[b].exit.successors());
+        }
+    }
+    None
+}
+
 fn reconverged(succs: &[Vec<usize>]) -> Vec<bool> {
     let n = succs.len();
     let ipdom = post_dominators(succs);

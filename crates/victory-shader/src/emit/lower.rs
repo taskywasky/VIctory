@@ -388,11 +388,14 @@ struct Split {
     ids: Option<(V, V, V)>,
 }
 
+fn lds_access(i: &Inst) -> bool {
+    let n = i.name();
+    matches!(i.fields, Fields::Ds { .. }) && !n.starts_with("ds_swizzle") && !n.contains("permute")
+}
+
 /// An LDS instruction that writes (stores and atomics).
 fn lds_write(i: &Inst) -> bool {
-    let n = i.name();
-    matches!(i.fields, Fields::Ds { .. })
-        && !(n.starts_with("ds_read") || n.starts_with("ds_swizzle") || n.contains("permute"))
+    lds_access(i) && !i.name().starts_with("ds_read")
 }
 
 /// What a split program exchanges between its halves ([`Lower::exchange`]).
@@ -1465,6 +1468,11 @@ impl<'a> Lower<'a> {
             split.convergent = super::split::convergent(self.x.st, |from, to| {
                 self.counters.contains_key(&to) && self.rpo[to] <= self.rpo[from]
             });
+            if split.lds_writes && split.threads > 32
+                && let Some(offset) = super::split::unfenced_lds(p, &order, &split.convergent, lds_access, lds_write)
+            {
+                return Err(unsupported(offset, "LDS accesses without a uniform LDS fence in split wave64"));
+            }
         }
         self.cur = self.s.entry;
         // D3D12's thread-group shared memory: 32 KiB.
@@ -3319,22 +3327,17 @@ impl<'a> Lower<'a> {
         ))
     }
 
-    /// Split waves: barriers the console compiler left out of a one-wave
-    /// group's LDS code, which the two halves need (`after_write`: after an
-    /// LDS write; else at the entry of IR block `b`, a join of divergent
-    /// paths, where a write on one of them must be seen after it). Where
-    /// the group is not together there is no barrier; a half reading
-    /// there what the other wrote there may read it early.
-    // shortcut: LDS written and read in the same divergent region by
-    // different halves stays unordered.
-    fn lds_sync(&mut self, b: usize, after_write: bool) {
+    /// Split waves: fence an LDS access before another half may need the
+    /// same data, or fence at the first convergent block after divergence.
+    /// `unfenced_lds` rejects access sequences that cannot be fenced here.
+    fn lds_sync(&mut self, b: usize, after_access: bool) {
         let Some(split) = &self.split else {
             return;
         };
-        if !split.lds_writes || !split.convergent[b] {
+        if !split.lds_writes || split.threads <= 32 || !split.convergent[b] {
             return;
         }
-        if !after_write {
+        if !after_access {
             let p = self.x.p;
             let join = p.blocks[b]
                 .preds
@@ -3880,7 +3883,7 @@ impl<'a> Lower<'a> {
             Fields::Buffer { .. } => self.buffer(inst, b, i),
             Fields::Exp { .. } => self.export(b, i),
             Fields::Ds { .. } => self.ds(inst, b, i).map(|()| {
-                if lds_write(inst) {
+                if lds_access(inst) {
                     self.lds_sync(b, true);
                 }
             }),

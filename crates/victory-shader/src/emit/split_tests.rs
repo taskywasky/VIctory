@@ -119,7 +119,7 @@ fn expected(lane: u32) -> [u32; RESULTS] {
 
 /// Lowers a wave64 program of 64 threads (root constants in s0-s3, the
 /// UAV table in s4) for a host whose widest wave is `host_wave_max`.
-fn lower_words(words: &[u32], host_wave_max: u32) -> Result<lower::Lowered, crate::ShaderError> {
+fn lower_words(words: &[u32], host_wave_max: u32, lds_blocks: u32) -> Result<lower::Lowered, crate::ShaderError> {
     let native = NativeProgram {
         stage: HwStage::Cs,
         wave64: true,
@@ -153,7 +153,7 @@ fn lower_words(words: &[u32], host_wave_max: u32) -> Result<lower::Lowered, crat
             slot: 1,
         }],
         io: StageIo::Cs(ComputeIo {
-            rsrc2: 5 << 1,
+            rsrc2: 5 << 1 | lds_blocks << 15,
             threads: [64, 1, 1],
         }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
@@ -179,7 +179,7 @@ fn lower_words(words: &[u32], host_wave_max: u32) -> Result<lower::Lowered, crat
 
 /// [`program`] lowered for a host whose widest wave is `host_wave_max`.
 fn build(host_wave_max: u32) -> HostShader {
-    let lowered = lower_words(&program(), host_wave_max).expect("lower");
+    let lowered = lower_words(&program(), host_wave_max, 0).expect("lower");
     let shader = HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,
@@ -301,8 +301,8 @@ fn a_split_lane_read_in_a_lane_branch_reads_within_its_half() {
     // s_or_b64 exec, exec, s[20:21].
     w.push(0x8000_0000 | 0x11 << 23 | 126 << 16 | 20 << 8 | 126);
     w.push(S_ENDPGM);
-    assert!(lower_words(&w, 64).is_ok());
-    let lowered = lower_words(&w, 32).expect("split lowers it");
+    assert!(lower_words(&w, 64, 0).is_ok());
+    let lowered = lower_words(&w, 32, 0).expect("split lowers it");
     let shader = HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,
@@ -337,4 +337,27 @@ fn a_split_lane_read_in_a_lane_branch_reads_within_its_half() {
         };
         assert_eq!(out[lane as usize], want, "lane {lane}");
     }
+}
+
+#[test]
+fn split_waves_refuse_unfenced_lds_writes_in_a_divergent_region() {
+    let mut words = vec![
+        vop2(0x1A, 1, int(2), 0),
+        vopc(0xC4, int(40), 0),
+        sop1(0x24, 20, VCC),
+        0xBF88_0000 | 4, // s_cbranch_execz over both LDS writes
+        0xD800_0000 | 0x0D << 18, // ds_write_b32 v1, v0
+        1,
+        0xD800_0000 | 0x0D << 18 | 4, // ds_write_b32 v1, v0 offset:4
+        1,
+        S_ENDPGM,
+    ];
+    assert!(lower_words(&words, 64, 1).is_ok());
+    assert!(matches!(
+        lower_words(&words, 32, 1),
+        Err(crate::ShaderError::Unsupported { what: "LDS accesses without a uniform LDS fence in split wave64", .. })
+    ));
+    words[3] = 0xBF88_0000 | 2;
+    words.drain(6..8);
+    assert!(lower_words(&words, 32, 1).is_ok(), "a lone write doesn't need an in-region fence");
 }

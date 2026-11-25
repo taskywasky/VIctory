@@ -127,6 +127,10 @@ returns. In divergent regions each half works over its own 32 lanes
 numbers kept): right for aggregated atomics and scalarization loops, wrong where
 the code needs one value for all 64 lanes. `v_readfirstlane` of a value
 that is the same in every lane needs neither.
-One-wave groups also get barriers after LDS writes and at joins, which the
-console compiler leaves out for a single wave. `VICTORY_HOST_WAVE_MAX=32`
-translates split on any device; the shader cache keys on the width.
+Groups that split one console wave across two host waves get LDS barriers
+between accesses in convergent code and at joins. A divergent region with
+an LDS write and another LDS access is refused: emitting the accesses
+unordered can hang NVIDIA devices, and placing a barrier inside the
+region can deadlock. A pipeline that uses such a shader does not run.
+`VICTORY_HOST_WAVE_MAX=32` translates split on any device; the shader cache
+keys on the width.
