@@ -996,6 +996,11 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
 /// console's layout and flags, in a format the host takes for its use.
 #[cfg(windows)]
 fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_FORMAT_SUPPORT1_RENDER_TARGET, D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW,
+    };
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+    const RENDER_TARGET: u32 = 1;
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
     if desc.dimension == BUFFER {
         return None;
@@ -1022,6 +1027,20 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
     // their unordered access views plain UNORM.
     if d.flags & UNORDERED != 0 && SRGB.iter().any(|&(srgb, _)| srgb == d.format) {
         d.format = family(d.format);
+    }
+    let support = |cap: i32| {
+        let has = |f| crate::host::format_support(DXGI_FORMAT(f as i32)).0 & cap != 0;
+        has(d.format)
+            || (family(d.format) == d.format
+                && (1..=115).any(|f| f != d.format && family(f) == d.format && has(f)))
+    };
+    if d.flags & RENDER_TARGET != 0 && !support(D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0) {
+        return None;
+    }
+    if d.flags & UNORDERED != 0 && !support(D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0) {
+        // Keep the sampled texture; the host cannot mirror its unordered views.
+        d.flags &= !UNORDERED;
+        d.format = pc_format(desc.format);
     }
     Some(d)
 }
@@ -1114,11 +1133,7 @@ fn shared_texture(
         && takes(t, &d)
     {
         SHARED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if let Some(host) = crate::host::host() {
-            // SAFETY: a plain query on a host description (same layout).
-            let info = unsafe { host.device.GetResourceAllocationInfo(0, &[std::ptr::from_ref(&d).cast::<windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC>().read_unaligned()]) };
-            SAVED.fetch_add(info.SizeInBytes, std::sync::atomic::Ordering::Relaxed);
-        }
+        SAVED.fetch_add(t.bytes, std::sync::atomic::Ordering::Relaxed);
         return live;
     }
     // shortcut: title textures of a replaced host texture keep it (placed
@@ -1851,6 +1866,35 @@ pub(crate) fn test_buffer(width: u64) -> This {
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[cfg(windows)]
+    #[test]
+    fn texture_flags_follow_host_format_support() {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_FORMAT_SUPPORT1_RENDER_TARGET, D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW,
+        };
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_B4G4R4A4_UNORM, DXGI_FORMAT_B5G5R5A1_UNORM, DXGI_FORMAT_R32_UINT,
+        };
+        if crate::host::host().is_none() {
+            return;
+        }
+        let mut d = texture(64, 64, DXGI_FORMAT_B5G5R5A1_UNORM.0 as u32, 1);
+        d.flags = UNORDERED;
+        let supports = |f, cap| crate::host::format_support(f).0 & cap != 0;
+        assert_eq!(
+            host_desc(&d).unwrap().flags & UNORDERED != 0,
+            supports(DXGI_FORMAT_B5G5R5A1_UNORM, D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0),
+        );
+        d.format = DXGI_FORMAT_R32_UINT.0 as u32;
+        assert_eq!(host_desc(&d).unwrap().flags, UNORDERED);
+        d.format = DXGI_FORMAT_B4G4R4A4_UNORM.0 as u32;
+        d.flags = 1;
+        assert_eq!(
+            host_desc(&d).is_some(),
+            supports(DXGI_FORMAT_B4G4R4A4_UNORM, D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0),
+        );
+    }
 
     #[test]
     fn a8_unorm_is_not_in_the_r8_typeless_family() {

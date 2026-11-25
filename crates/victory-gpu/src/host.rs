@@ -2613,6 +2613,28 @@ fn title_window() -> Option<HWND> {
     found
 }
 
+/// Format capabilities are fixed for the process's host adapter.
+pub(crate) fn format_support(format: DXGI_FORMAT) -> D3D12_FORMAT_SUPPORT1 {
+    static KNOWN: Mutex<Vec<(DXGI_FORMAT, D3D12_FORMAT_SUPPORT1)>> = Mutex::new(Vec::new());
+    let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&(_, support)) = known.iter().find(|(f, _)| *f == format) {
+        return support;
+    }
+    let Some(host) = host() else { return D3D12_FORMAT_SUPPORT1_NONE };
+    let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT { Format: format, ..Default::default() };
+    // SAFETY: a query into the matching feature data type.
+    let ok = unsafe {
+        host.device.CheckFeatureSupport(
+            D3D12_FEATURE_FORMAT_SUPPORT,
+            (&raw mut support).cast(),
+            size_of_val(&support) as u32,
+        )
+    };
+    let support = if ok.is_ok() { support.Support1 } else { D3D12_FORMAT_SUPPORT1_NONE };
+    known.push((format, support));
+    support
+}
+
 /// `state` without the bits the host texture's flags forbid: the console
 /// lets the title name states its own resources allow (unordered access on
 /// a depth target, whose host copy cannot have both).

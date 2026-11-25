@@ -200,8 +200,9 @@ Every build appends unhandled exceptions, panics, and host GPU failures to
 `crashes.log` in the title's data folder.
 
 For a crash at world entry, run the diagnostics build with
-`VICTORY_D3D12_DRED=1` and keep the device-removed reason, breadcrumbs,
-and `crashes.log`. To separate streaming time from GPU work, include
+`VICTORY_D3D12_DEBUG=1` and `VICTORY_D3D12_DRED=1`. Keep the console
+validation messages, device-removed reason, breadcrumbs, and `crashes.log`.
+To separate streaming time from GPU work, include
 `victory_hle::modules::dstorage=debug` in `VICTORY_LOG` to log throughput
 and worker activity during loading.
 
