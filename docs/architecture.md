@@ -105,3 +105,28 @@ the lanes take, from structurisation), and accessed with a non-uniform heap
 index in one pass. `victory translate`
 runs every shader it finds (containers, SGD5 files) through these and
 lists what they cannot handle yet.
+
+Compute programs that depend on their lane layout (cross-lane reads, lane
+masks read as numbers, LDS shared within one wave) declare the console's
+wave size. A console wave64 program on a host without 64-lane waves
+(NVIDIA: `WaveLaneCountMax` 32, which `victory-gpu` reports to the
+translator when it creates the device) runs *split* instead
+(`victory_shader::emit::split`): it declares `WaveSize(32)`, and each
+console wave runs as two host waves, its low and high half. Thread ids,
+lane indices and masks stay the console's. DPP, `ds_swizzle` and
+`v_permlanex16` stay within 32 lanes and need nothing else. Ballots,
+`v_readlane`, `v_readfirstlane` (of a value that differs between lanes),
+and whole-wave reductions and prefix sums combine the
+two halves' parts through a few group-shared dwords between thread-group
+barriers, which gives the console's results exactly. A barrier needs the
+whole group, so that is only possible where every thread runs together:
+with one console wave per group, outside any lane branch's region; with
+several, before the first branch. Elsewhere each half works over its own
+32 lanes, as pixel and vertex programs do over the host's wave (counts,
+first lanes, prefixes and reductions of the half, console lane numbers
+kept): right for aggregated atomics and scalarization loops, wrong where
+the code needs one value for all 64 lanes. `v_readfirstlane` of a value
+that is the same in every lane needs neither.
+One-wave groups also get barriers after LDS writes and at joins, which the
+console compiler leaves out for a single wave. `VICTORY_HOST_WAVE_MAX=32`
+translates split on any device; the shader cache keys on the width.

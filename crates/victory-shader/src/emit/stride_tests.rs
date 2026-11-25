@@ -194,6 +194,7 @@ fn build(
         prims: Vec::new(),
         mesh_stride: 0,
         view_marks: false,
+        host_wave_max: 64,
     })
     .expect("lower");
     let shader = HostShader {

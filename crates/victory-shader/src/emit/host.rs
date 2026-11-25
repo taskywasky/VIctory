@@ -129,6 +129,21 @@ impl Host {
         }
     }
 
+    /// The widest wave supported by this adapter, if reported.
+    pub fn wave_lane_max(&self) -> Option<u32> {
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: the query writes the matching structure of the given size.
+        unsafe {
+            self.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        }
+        .ok()
+        .map(|()| options.WaveLaneCountMax)
+    }
+
     /// The root signature translated shaders expect: user data per stage
     /// at `b0`, immediate samplers per stage at `s<n>`, heaps directly
     /// indexed.
@@ -718,6 +733,7 @@ fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
         prims: Vec::new(),
         mesh_stride: 0,
         view_marks: false,
+        host_wave_max: 64,
     })?;
     Ok(HostShader {
         stage: HwStage::Cs,

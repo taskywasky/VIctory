@@ -201,6 +201,9 @@ mod sampler;
 #[cfg(all(test, windows))]
 mod semantics_tests;
 mod shader;
+mod split;
+#[cfg(all(test, windows))]
+mod split_tests;
 #[cfg(all(test, windows))]
 mod stride_tests;
 #[cfg(all(test, windows))]
@@ -244,6 +247,38 @@ pub fn loop_limit() -> u32 {
             lower::LOOP_LIMIT
         }
     })
+}
+
+/// The widest wave the host device runs (`WaveLaneCountMax`); 64 until the
+/// device says otherwise ([`set_host_wave_max`]).
+static HOST_WAVE_MAX: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(64);
+
+/// Records the host device's widest wave. Below 64 (NVIDIA: 32 lanes only),
+/// a console wave64 compute program that depends on its lane layout runs
+/// split: each console wave as two 32-lane host waves that combine their
+/// halves of each cross-lane operation through group-shared memory
+/// (`lower::Split`). Translations depend on it, so the shader cache must
+/// key on [`host_wave_max`] (`victory-gpu`'s does).
+pub fn set_host_wave_max(lanes: u32) {
+    HOST_WAVE_MAX.store(lanes, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The widest wave translations target: the device's
+/// ([`set_host_wave_max`]), or `VICTORY_HOST_WAVE_MAX` when set (32 tries
+/// split waves on a device that has 64-lane ones).
+pub fn host_wave_max() -> u32 {
+    let device = HOST_WAVE_MAX.load(std::sync::atomic::Ordering::Relaxed);
+    parse_wave_max(std::env::var("VICTORY_HOST_WAVE_MAX").ok().as_deref())
+        .map_or(device, |n| n.min(device))
+}
+
+/// `VICTORY_HOST_WAVE_MAX`'s value: 32 or 64, else none. Pure, for testing.
+fn parse_wave_max(value: Option<&str>) -> Option<u32> {
+    match value.map(str::trim) {
+        Some("32") => Some(32),
+        Some("64") => Some(64),
+        _ => None,
+    }
 }
 
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
@@ -481,6 +516,7 @@ pub fn emit_with(
         prims: prims.clone(),
         mesh_stride,
         view_marks: options.view_marks,
+        host_wave_max: host_wave_max(),
     };
     let l = match lower::lower(&parts(st, res)) {
         // Discarded lanes kept on as helpers can read what no surviving

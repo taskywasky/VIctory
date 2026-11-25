@@ -37,12 +37,12 @@ What each part does today and what it still needs:
 | Loader | Runs the title's executable and its DLLs in our process; crash reports name the faulting code and are kept in `crashes.log` | – |
 | Runtime services | One signed-in offline user, licences, packages, saves that survive a kill at any step, text entry dialog | Speech is silent; the dialog and relaunch are untested live |
 | Network | Offline by design: the title cannot reach the network | – |
-| Files and streaming | Archives and streamed data read, zlib and BCPack decoded in parallel | Loading is limited by writes into title memory |
+| Files and streaming | Archive reads overlap, including reads from the same file; zlib and BCPack decode in parallel | Storage latency and writes into title memory can still limit loading |
 | Input | XInput pads, keyboard, keyboard stand-in pad | Trigger rumble |
 | Audio | Menu, video and loading sound; XMA voices and Opus streams decode | Reverb is silent; Opus results unverified against the title |
 | GPU: menus | Draws, compute and presentation on host D3D12; only changed title memory is copied | Frame pacing drifts on one screen in release builds |
 | GPU: world | The scene is drawn and presented: mesh pipelines, indirect execution, views the shaders pick from the heap themselves, title memory read by address (ray-tracing structures), depth written from compute, pipelines pre-built or made by worker threads and kept on disk | Lighting (surfaces are unlit) and some missing geometry; frames take 1-2 s; draws of untranslated shaders are dropped; real queries, depth bounds, HDR and scaling are missing |
-| Shaders | Console GPU code recompiled to DXIL, ahead of time (`translate --cache`) or at first use, cached on disk. Menus: all. World: mesh 8,765 of 8,765, vertex/pixel 12,550 of 12,592, compute 2,579 of 2,637 | Merged geometry stages (195 programs) and about 100 others; fused multiply-adds follow the host GPU; some compute programs need a GPU with 64-lane waves |
+| Shaders | Console GPU code recompiled to DXIL, ahead of time (`translate --cache`) or at first use, cached on disk. Wave64 compute can run split on 32-lane adapters | Merged geometry stages and other unsupported instructions; split-wave operations in divergent code may differ from the console; fused multiply-adds follow the host GPU |
 | Textures | Console tiled layouts and detiling for the modes the title uses | Render-target metadata planes |
 | Series S mode | Runs through the menus to the loading screen | The world, as above |
 
@@ -89,9 +89,10 @@ compiles none of those either; the library belongs to the GPU and driver it
 was made on. Run again, it skips what is there in seconds; stopped
 early, it keeps what it made.
 
-If world loading drags, prebuild both caches before timing it. Run from
-the same cache directory on the same GPU and driver; the loading screen
-still has to stream the title's data.
+If world loading drags, prebuild both caches before timing it. Use the
+same cache directory, GPU and driver, and leave the D3D12 debug layer off
+when measuring. The loading screen still streams the title's data; an SSD
+helps when archive reads are the bottleneck.
 
 Upscaling (Series S mode): the title upscales with AMD FidelityFX. To run
 it with the PC build on your GPU instead of the console build, get the
