@@ -71,6 +71,7 @@
 *.rar
 
 # Editor / OS noise
+.omp/
 .vs/
 .idea/
 *.swp

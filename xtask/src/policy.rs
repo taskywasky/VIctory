@@ -130,7 +130,7 @@ fn list_files(root: &Path, staged: bool) -> Result<Vec<String>> {
     // Not a git repository: walk everything except build output.
     Ok(walkdir::WalkDir::new(root)
         .into_iter()
-        .filter_entry(|e| !matches!(e.file_name().to_str(), Some("target" | ".git")))
+        .filter_entry(|e| !matches!(e.file_name().to_str(), Some("target" | ".git" | ".omp")))
         .filter_map(Result::ok)
         .filter(|e| e.file_type().is_file())
         .filter_map(|e| {
@@ -144,6 +144,9 @@ fn list_files(root: &Path, staged: bool) -> Result<Vec<String>> {
 
 /// All problems with one file. Pure, for testing.
 pub fn check(path: &str, content: &[u8]) -> Vec<String> {
+    if path.split('/').any(|component| component.eq_ignore_ascii_case(".omp")) {
+        return vec!["local .omp files must not be committed".to_owned()];
+    }
     let mut problems = Vec::new();
     let name = path.rsplit('/').next().unwrap_or(path);
     let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
@@ -235,6 +238,13 @@ mod tests {
         assert!(check("crates/x/src/lib.rs", b"fn main() {}\n").is_empty());
         assert!(check(".gitignore", b"/target/\n").is_empty());
         assert!(check(".githooks/pre-commit", b"#!/bin/sh\n").is_empty());
+    }
+
+    #[test]
+    fn rejects_local_tooling_even_with_an_allowed_extension() {
+        assert!(!check(".omp/tests/output.txt", b"test output").is_empty());
+        assert!(!check("nested/.OMP/settings.json", b"{}").is_empty());
+        assert!(check("docs/omp.md", b"notes").is_empty());
     }
 
     #[test]
