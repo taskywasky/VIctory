@@ -133,8 +133,8 @@ the code needs one value for all 64 lanes. `v_readfirstlane` of a value
 that is the same in every lane needs neither.
 Groups that split one console wave across two host waves get LDS barriers
 between accesses in convergent code and at joins. A divergent region with
-an LDS write and another LDS access is refused: emitting the accesses
-unordered can hang NVIDIA devices, and placing a barrier inside the
-region can deadlock. A pipeline that uses such a shader does not run.
+an LDS write and another access is refused unless two lane-indexed stores
+are proven to touch disjoint host dwords. Unordered conflicting accesses
+can hang NVIDIA devices, and a barrier inside the region can deadlock.
 `VICTORY_HOST_WAVE_MAX=32` translates split on any device; the shader cache
 keys on the width.

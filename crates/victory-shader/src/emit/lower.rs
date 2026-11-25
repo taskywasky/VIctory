@@ -1489,7 +1489,12 @@ impl<'a> Lower<'a> {
                     && !self.guarded_latches.contains_key(&from)
             });
             if split.lds_writes && split.threads > 32
-                && let Some(offset) = super::split::unfenced_lds(p, &order, &split.convergent, lds_access, lds_write)
+                && let Some(offset) = super::split::unfenced_lds(
+                    p, &order, &split.convergent, lds_access, lds_write,
+                    |root, block, first, second| {
+                        super::split::independent_stores(p, self.x.st, root, block, first, second, split.base * 4)
+                    },
+                )
             {
                 return Err(unsupported(offset, "LDS accesses without a uniform LDS fence in split wave64"));
             }

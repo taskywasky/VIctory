@@ -389,3 +389,48 @@ fn split_waves_rejoin_after_a_loop_with_a_separate_latch() {
         assert_eq!(out, (0..64).map(|lane| (lane ^ 32) + 2).collect::<Vec<_>>());
     }
 }
+
+#[test]
+fn split_waves_allow_only_disjoint_lds_stores_in_a_lane_prefix() {
+    let mut words = vec![sop1(0x03, 5, 0x80)];
+    words.extend(s_load_dwordx4(8, 4));
+    words.extend(vop3(0x365, 2, 193, int(0), 0));
+    words.extend(vop3(0x366, 2, 193, vgpr(2), 0));
+    words.extend([
+        vop2(0x25, 4, int(1), 2),
+        vopc(0xC4, int(40), 2),
+        sop1(0x24, 20, VCC),
+        0xBF88_0006, // Only lanes 0–39 store; all lanes read after the join.
+        vop2(0x1A, 7, int(1), 2),
+        vop2(0x1A, 10, int(3), 2),
+        0xD800_0000 | 0x1F << 18 | 320, // Halfwords after the dword pairs.
+        4 << 8 | 7,
+        0xD800_0000 | 0x0E << 18 | 1 << 8,
+        4 << 16 | 4 << 8 | 10,
+        0x8000_0000 | 0x11 << 23 | 126 << 16 | 20 << 8 | 126, // Restore EXEC.
+        vop2(0x1D, 3, int(32), 2),
+        vop2(0x13, 3, int(39), 3),
+        vop2(0x1A, 7, int(1), 3),
+        vop2(0x1A, 10, int(3), 3),
+        0xD800_0000 | 0x3C << 18 | 320, // ds_read_u16 v5, v7
+        5 << 24 | 7,
+        0xD800_0000 | 0x36 << 18 | 4, // ds_read_b32 v6, v10 offset:4
+        6 << 24 | 10,
+        vop2(0x25, 5, vgpr(6), 5),
+        vop2(0x1A, 1, int(2), 2),
+    ]);
+    words.extend(buffer_store_dword_offen(5, 1, 8, 0));
+    words.push(S_ENDPGM);
+    let shader = host_shader(lower_words(&words, 32, 1).expect("lower disjoint stores"));
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(out) = run_hardware(&shader, 64) {
+        assert_eq!(out, (0..64).map(|lane| 2 * ((lane ^ 32_u32).min(39) + 1)).collect::<Vec<_>>());
+    }
+    words[13] = 0xD800_0000 | 0x1F << 18 | 318;
+    assert!(matches!(
+        lower_words(&words, 32, 1),
+        Err(crate::ShaderError::Unsupported {
+            what: "LDS accesses without a uniform LDS fence in split wave64", ..
+        })
+    ));
+}

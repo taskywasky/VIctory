@@ -11,7 +11,9 @@
 //! finds those blocks; elsewhere each half works alone, over its own 32
 //! lanes.
 
-use crate::structure::{LaneExit, Structured};
+use crate::gfx10::{Fields, Operand};
+use crate::ir::{Inst, Program, Reg, Value};
+use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 /// Per block: whether every thread of the group that starts the program
 /// reaches it, together and as often as the others.
@@ -44,14 +46,15 @@ pub(crate) fn convergent(
 }
 
 /// The two halves may run different arms of a region at the same time.
-/// Multiple reads are safe; with a write we cannot order another access
-/// without a group barrier, and cannot put one inside the region.
-pub(crate) fn unfenced_lds(
-    p: &crate::ir::Program,
+/// Another access after a write needs a barrier unless the compiler can
+/// prove that two stores touch different host dwords.
+pub(super) fn unfenced_lds(
+    p: &Program,
     order: &[usize],
     uniform: &[bool],
-    access: impl Fn(&crate::ir::Inst) -> bool,
-    write: impl Fn(&crate::ir::Inst) -> bool,
+    access: impl Fn(&Inst) -> bool,
+    write: impl Fn(&Inst) -> bool,
+    independent: impl Fn(usize, usize, &Inst, &Inst) -> bool,
 ) -> Option<usize> {
     let mut seen = vec![usize::MAX; p.blocks.len()];
     for &root in order {
@@ -59,7 +62,9 @@ pub(crate) fn unfenced_lds(
             continue;
         }
         let mut work = p.blocks[root].exit.successors();
-        let (mut read, mut written) = (false, false);
+        let mut previous = None;
+        let mut multiple = false;
+        let mut written = false;
         while let Some(b) = work.pop() {
             if uniform[b] || seen[b] == root {
                 continue;
@@ -67,16 +72,100 @@ pub(crate) fn unfenced_lds(
             seen[b] = root;
             for inst in p.blocks[b].insts.iter().filter(|i| access(i)) {
                 let writes = write(inst);
-                if written || read && writes {
+                if (written || previous.is_some() && writes)
+                    && !(writes && written && !multiple
+                        && previous.is_some_and(|(block, first)| block == b && independent(root, b, first, inst)))
+                {
                     return Some(inst.machine.offset);
                 }
                 written |= writes;
-                read |= !writes;
+                multiple |= previous.is_some();
+                previous = Some((b, inst));
             }
             work.extend(p.blocks[b].exit.successors());
         }
     }
     None
+}
+
+/// Two ordinary stores in the same short lane-prefix arm can use separate
+/// LDS ranges without synchronizing. Include the full dwords used by the
+/// host to implement sub-dword stores.
+pub(super) fn independent_stores(
+    p: &Program, st: &Structured, root: usize, block: usize, first: &Inst, second: &Inst, bytes: u32,
+) -> bool {
+    let proof = || {
+        let LaneExit::Branch { when, taken, not_taken } = st.exits[root] else { return None };
+        let Some((Atom::Lane(test), lo, hi)) = st.bools.node(when) else { return None };
+        let join = match (lo, hi) {
+            (Bool::FALSE, Bool::TRUE) if taken == block => not_taken,
+            (Bool::TRUE, Bool::FALSE) if not_taken == block => taken,
+            _ => return None,
+        };
+        if p.blocks[block].preds != [root] || !matches!(st.exits[block], LaneExit::Jump(t) if t == join) {
+            return None;
+        }
+        let plain = |b: usize, value: Value| {
+            p.blocks[b].insts.iter().zip(&st.guards[b])
+                .find(|(i, guard)| guard.is_none() && i.writes.iter().any(|&(_, v)| v == value))
+                .map(|(i, _)| i)
+        };
+        let operands = |inst: &Inst| {
+            let Fields::Valu(v) = &inst.fields else { return None };
+            let &[a, b] = v.src.as_slice() else { return None };
+            (v.neg == 0 && v.abs == 0 && v.opsel == 0 && v.sdwa.is_none() && v.dpp.is_none()).then_some((a, b))
+        };
+        let value = |inst: &Inst, op| match op {
+            Operand::Vector { reg, dwords: 1 } => inst.read(Reg::V(reg)),
+            _ => None,
+        };
+        let imm = |op| match op {
+            Operand::Const(c @ 128..=192) => Some(u32::from(c - 128)),
+            Operand::Literal(v) => Some(v),
+            _ => None,
+        };
+        // The comparison itself may narrow EXEC; only the lane-id
+        // definitions must execute unconditionally in its block.
+        let cmp = p.blocks[root].insts.iter().find(|i| i.writes.iter().any(|&(_, v)| v == test))?;
+        if !matches!(cmp.name(), "v_cmpx_gt_i32" | "v_cmp_gt_u32") {
+            return None;
+        }
+        let (limit, lane) = operands(cmp)?;
+        let count = imm(limit)?;
+        if !(1..=64).contains(&count) {
+            return None;
+        }
+        let lane = value(cmp, lane)?;
+        let high = plain(root, lane)?;
+        let (mask, low) = operands(high)?;
+        let low = plain(root, value(high, low)?)?;
+        if high.name() != "v_mbcnt_hi_u32_b32" || mask != Operand::Const(193)
+            || low.name() != "v_mbcnt_lo_u32_b32" || operands(low)? != (Operand::Const(193), Operand::Const(128))
+        {
+            return None;
+        }
+        let range = |i: &Inst| {
+            let Fields::Ds { addr: Some(addr), offset0, offset1, gds: false, .. } = i.fields else { return None };
+            let def = plain(block, value(i, addr)?)?;
+            let (shift, source) = operands(def)?;
+            let shift = imm(shift)?;
+            if def.name() != "v_lshlrev_b32" || value(def, source)? != lane || shift > 5 {
+                return None;
+            }
+            let (start, end, align) = match i.name() {
+                "ds_write_b16" => (u32::from(offset0) | u32::from(offset1) << 8, 2, 2),
+                "ds_write_b32" => (u32::from(offset0) | u32::from(offset1) << 8, 4, 4),
+                "ds_write2_b32" if offset0.abs_diff(offset1) == 1 => (u32::from(offset0.min(offset1)) * 4, 8, 4),
+                _ => return None,
+            };
+            let last = (start + ((count - 1) << shift) + end).next_multiple_of(4);
+            (start % align == 0 && (1 << shift) >= end && last <= bytes).then_some((start & !3, last))
+        };
+        let (a, b) = range(first)?;
+        let (c, d) = range(second)?;
+        Some(b <= c || d <= a)
+    };
+    proof().unwrap_or(false)
 }
 
 fn reconverged(succs: &[Vec<usize>]) -> Vec<bool> {
