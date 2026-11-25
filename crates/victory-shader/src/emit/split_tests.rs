@@ -177,9 +177,7 @@ fn lower_words(words: &[u32], host_wave_max: u32, lds_blocks: u32) -> Result<low
     })
 }
 
-/// [`program`] lowered for a host whose widest wave is `host_wave_max`.
-fn build(host_wave_max: u32) -> HostShader {
-    let lowered = lower_words(&program(), host_wave_max, 0).expect("lower");
+fn host_shader(lowered: lower::Lowered) -> HostShader {
     let shader = HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,
@@ -212,7 +210,7 @@ fn a_split_wave64_gives_the_consoles_lanes_masks_and_reads() {
         .unwrap_or_else(|e| e.into_inner());
     let mut ran = 0;
     for host_wave_max in [64, 32] {
-        let shader = build(host_wave_max);
+        let shader = host_shader(lower_words(&program(), host_wave_max, 0).expect("lower"));
         for (label, warp) in [("hardware", false), ("warp", true)] {
             let Ok(host) = Host::new(warp) else {
                 eprintln!("no SM 6.6 {label} device; skipped");
@@ -360,4 +358,34 @@ fn split_waves_refuse_unfenced_lds_writes_in_a_divergent_region() {
     words[3] = 0xBF88_0000 | 2;
     words.drain(6..8);
     assert!(lower_words(&words, 32, 1).is_ok(), "a lone write doesn't need an in-region fence");
+}
+
+#[test]
+fn split_waves_rejoin_after_a_loop_with_a_separate_latch() {
+    let mut words = vec![sop1(0x03, 5, 0x80)];
+    words.extend(s_load_dwordx4(8, 4));
+    words.extend([
+        vop2(0x1A, 1, int(2), 0), // Per-lane byte offset.
+        vop1(0x01, 4, int(0)),
+        0xBF82_0001, // Enter at the loop test, not the latch.
+        vop2(0x25, 4, int(1), 4), // Latch: increase the counter.
+        vopc(0xC4, int(2), 4),
+        0xBF87_FFFD, // While counter < 2, go back via the latch.
+        vop2(0x25, 4, vgpr(0), 4),
+        0xD800_0000 | 0x0D << 18, // ds_write_b32 v1, v4
+        4 << 8 | 1,
+        vop2(0x1D, 3, u16::from(LITERAL), 1),
+        128, // Same lane of the other host wave.
+        0xD800_0000 | 0x36 << 18, // ds_read_b32 v2, v3
+        2 << 24 | 3,
+    ]);
+    words.extend(buffer_store_dword_offen(2, 1, 8, 0));
+    words.push(S_ENDPGM);
+    let shader = host_shader(lower_words(&words, 32, 1).expect("lower loop and LDS exchange"));
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(out) = run_hardware(&shader, 64) {
+        assert_eq!(out, (0..64).map(|lane| (lane ^ 32) + 2).collect::<Vec<_>>());
+    }
 }

@@ -122,7 +122,11 @@ barriers, which gives the console's results exactly. A barrier needs the
 whole group, so that is only possible where every thread runs together.
 Split lowering treats scalar branches as potentially divergent, since
 prior half-local operations can disagree, and accounts for loop-watchdog
-returns. In divergent regions each half works over its own 32 lanes
+returns. In split-wave programs that write LDS, a loop with a
+single-predecessor latch and an existing forward exit checks its budget at
+the branch into the latch. On exhaustion lanes take that exit instead of
+returning, so later group barriers still have every thread. In divergent
+regions each half works over its own 32 lanes
 (counts, first lanes, prefixes and reductions of the half, console lane
 numbers kept): right for aggregated atomics and scalarization loops, wrong where
 the code needs one value for all 64 lanes. `v_readfirstlane` of a value

@@ -278,6 +278,8 @@ struct Lower<'a> {
     /// Loop headers' iteration counters (see [`LOOP_LIMIT`]): the phi by
     /// IR block, and its incoming (value, DXIL block) pairs.
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
+    /// Split-wave latches whose watchdog runs at their sole predecessor.
+    guarded_latches: HashMap<usize, usize>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
     /// The 16/64-bit round mode (MODE bits 3:2) each block starts with, and
@@ -784,6 +786,7 @@ impl<'a> Lower<'a> {
             section_out: HashSet::new(),
             code_table: None,
             counters: HashMap::new(),
+            guarded_latches: HashMap::new(),
             abort: None,
             round16: round16(p),
             mode16: Some(0),
@@ -1465,8 +1468,25 @@ impl<'a> Lower<'a> {
             }
         }
         if let Some(split) = &mut self.split {
+            if split.lds_writes {
+                for &latch in &order {
+                    let [pred] = p.blocks[latch].preds.as_slice() else { continue };
+                    let LaneExit::Jump(header) = self.x.st.exits[latch] else { continue };
+                    let LaneExit::Branch { taken, not_taken, .. } = self.x.st.exits[*pred] else { continue };
+                    let other = if taken == latch { not_taken } else if not_taken == latch { taken } else { continue };
+                    // The IR has single-entry loops. The loop counter dominates
+                    // the branch; exhaustion can take its existing forward exit.
+                    if self.rpo[header] <= self.rpo[*pred] && self.rpo[*pred] < self.rpo[latch]
+                        && other != latch && self.rpo[*pred] < self.rpo[other]
+                        && !matches!(self.x.st.exits[other], LaneExit::Jump(t) if self.rpo[t] <= self.rpo[*pred])
+                    {
+                        self.guarded_latches.insert(latch, header);
+                    }
+                }
+            }
             split.convergent = super::split::convergent(self.x.st, |from, to| {
                 self.counters.contains_key(&to) && self.rpo[to] <= self.rpo[from]
+                    && !self.guarded_latches.contains_key(&from)
             });
             if split.lds_writes && split.threads > 32
                 && let Some(offset) = super::split::unfenced_lds(p, &order, &split.convergent, lds_access, lds_write)
@@ -10455,9 +10475,14 @@ impl<'a> Lower<'a> {
             .map_or(self.x.p.blocks[b].offset, |i| i.machine.offset);
         let term = match self.x.st.exits[b] {
             LaneExit::Jump(t) if self.counters.contains_key(&t) && self.rpo[t] <= self.rpo[b] => {
-                let ok = self.count_iteration(t, pred::IULT);
-                let abort = self.abort_block();
-                Term::CondBr(ok, self.block[t].expect("reachable"), abort)
+                let next = self.advance_loop(t);
+                if self.guarded_latches.contains_key(&b) {
+                    Term::Br(self.block[t].expect("reachable"))
+                } else {
+                    let ok = self.loop_budget(next, pred::IULT);
+                    let abort = self.abort_block();
+                    Term::CondBr(ok, self.block[t].expect("reachable"), abort)
+                }
             }
             LaneExit::Jump(t) => {
                 self.enter_loop(b, t, self.cur);
@@ -10489,10 +10514,20 @@ impl<'a> Lower<'a> {
                 // (No `xor` of a compare: a loop exit testing one hung the
                 // AMD driver.)
                 let cond = if back(self, taken) {
-                    let ok = self.count_iteration(taken, pred::IULT);
+                    let next = self.advance_loop(taken);
+                    let ok = self.loop_budget(next, pred::IULT);
                     self.s.m.bin(self.cur, Bin::And, cond, ok)
                 } else if back(self, not_taken) {
-                    let stop = self.count_iteration(not_taken, pred::IUGE);
+                    let next = self.advance_loop(not_taken);
+                    let stop = self.loop_budget(next, pred::IUGE);
+                    self.s.m.bin(self.cur, Bin::Or, cond, stop)
+                } else if let Some(&header) = self.guarded_latches.get(&taken) {
+                    let next = self.next_iteration(header);
+                    let ok = self.loop_budget(next, pred::IULT);
+                    self.s.m.bin(self.cur, Bin::And, cond, ok)
+                } else if let Some(&header) = self.guarded_latches.get(&not_taken) {
+                    let next = self.next_iteration(header);
+                    let stop = self.loop_budget(next, pred::IUGE);
                     self.s.m.bin(self.cur, Bin::Or, cond, stop)
                 } else {
                     cond
@@ -10538,21 +10573,21 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// A back edge to header `to` (a back edge keeps its block, no
-    /// critical-edge block): the count goes up; the result compares it with
-    /// [`LOOP_LIMIT`] by `p` (below: go on; at or above: stop).
-    fn count_iteration(&mut self, to: usize, p: u8) -> V {
-        let c = self.cur;
+    fn next_iteration(&mut self, to: usize) -> V {
         let (phi, _) = self.counters[&to];
         let one = self.s.m.i32(1);
-        let next = self.s.m.bin(c, Bin::Add, phi, one);
+        self.s.m.bin(self.cur, Bin::Add, phi, one)
+    }
+
+    fn advance_loop(&mut self, to: usize) -> V {
+        let next = self.next_iteration(to);
+        self.counters.get_mut(&to).expect("header").1.push((next, self.cur));
+        next
+    }
+
+    fn loop_budget(&mut self, next: V, cmp: u8) -> V {
         let limit = self.s.m.i32(super::loop_limit());
-        self.counters
-            .get_mut(&to)
-            .expect("header")
-            .1
-            .push((next, c));
-        self.s.m.cmp(c, p, next, limit)
+        self.s.m.cmp(self.cur, cmp, next, limit)
     }
 
     /// The block a lane stopped by [`LOOP_LIMIT`] leaves through.
