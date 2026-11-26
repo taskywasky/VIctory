@@ -686,12 +686,12 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
     /// host cannot.
     pub(crate) fn make_at(&self, index: u32, view: &View) {
-        let (kept, mark) = make_marked(view, self.cpu(index));
+        let (kept, mark, raw) = make_marked(view, self.cpu(index));
         if kept.is_none() {
             null_for(view, self.cpu(index));
         }
         self.keep(index, kept.flatten());
-        self.set_stride(index, Some(view));
+        self.set_stride(index, Some(view), raw);
         self.set_mark(index, mark);
         self.note_address(index, Some(view));
     }
@@ -749,7 +749,7 @@ impl HostHeap {
             }
         }
         self.keep(index, buffer.map(|b| (b.clone(), None)));
-        self.write_stride(index, 4);
+        self.write_stride(index, 4 | if !uav && buffer.is_some() { victory_shader::emit::VIEW_RAW_SRV } else { 0 });
         self.set_mark(index, None);
     }
 
@@ -761,7 +761,7 @@ impl HostHeap {
             null_view(self.cpu(index));
         }
         self.keep(index, None);
-        self.set_stride(index, None);
+        self.set_stride(index, None, false);
         // Unmarked by host slot: a block given back leaves none behind.
         self.set_mark(index, None);
         self.note_address(index, None);
@@ -771,10 +771,10 @@ impl HostHeap {
     }
 
     /// Enters the byte stride of `view` (0 for none or not a buffer view)
-    /// for slot `index` in the view-stride table, with the integer-format
-    /// bits of a typed buffer view ([`view_kind`]).
-    fn set_stride(&self, index: u32, view: Option<&View>) {
-        self.write_stride(index, view.map_or(0, |v| view_stride(v) | view_kind(v)));
+    /// for slot `index`, with the buffer's format and raw SRV flags.
+    fn set_stride(&self, index: u32, view: Option<&View>, raw: bool) {
+        let raw = if raw { victory_shader::emit::VIEW_RAW_SRV } else { 0 };
+        self.write_stride(index, view.map_or(0, |v| view_stride(v) | view_kind(v)) | raw);
     }
 
     fn write_stride(&self, index: u32, stride: u32) {
@@ -1049,14 +1049,14 @@ impl HostHeap {
             if later {
                 crate::shadow::forget_read(slot);
             }
-            self.set_stride(slot, Some(&view));
             self.note_address(slot, Some(&view));
             made[slot as usize] = key;
-            let (kept, mark) = if later {
-                (None, None)
+            let (kept, mark, raw) = if later {
+                (None, None, false)
             } else {
                 make_marked(&view, self.cpu(slot))
             };
+            self.set_stride(slot, Some(&view), raw);
             // By host slot, as shaders read it: their heap index is the
             // host's (through the view-block table where there is one).
             self.set_mark(slot, mark);
@@ -1463,10 +1463,9 @@ static REFUSED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new
 /// Translated shaders read untyped buffers as raw bytes (scalar loads at a
 /// byte address, raw loads at `element * stride + offset`). Through a
 /// structured host view such a read gives zeros on NVIDIA (an RTX 5090:
-/// byte 20 of a 16-byte-stride view read 0), while structured reads
-/// through a raw view are right; so the host's view is raw where it can be.
-/// The view-stride table keeps the title's stride. Ported from
-/// fxceless/victory-gta6 (GPL-3.0), commit 578d459c, `raw_window`.
+/// byte 20 of a 16-byte-stride view read 0). The host uses a raw view
+/// where it can, and publishes that choice along with the title stride.
+/// Ported from fxceless/victory-gta6 (GPL-3.0), commit 578d459c, `raw_window`.
 fn raw_window(start: u64, bytes: u64) -> Option<(u64, u32)> {
     if !start.is_multiple_of(16) || !bytes.is_multiple_of(4) {
         return None;
@@ -1519,6 +1518,7 @@ fn buffer_srv(
         buffer.StructureByteStride = 0;
         buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
     }
+    RAW_SRV.with(|raw| raw.set(buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0));
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
@@ -1603,15 +1603,17 @@ thread_local! {
     /// The view-mark entry of the unordered buffer view [`make`] last made
     /// on this thread ([`make_marked`]).
     static MARK: std::cell::Cell<Option<(u32, u32)>> = const { std::cell::Cell::new(None) };
+    static RAW_SRV: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// [`make`], and the view-mark entry of the view if it is an unordered
 /// buffer view whose writes shaders mark (`victory_shader::emit`, "Write
 /// marks").
-fn make_marked(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> (Option<Kept>, Option<(u32, u32)>) {
+fn make_marked(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> (Option<Kept>, Option<(u32, u32)>, bool) {
     MARK.with(|m| m.set(None));
+    RAW_SRV.with(|raw| raw.set(false));
     let kept = make(view, at);
-    (kept, MARK.with(std::cell::Cell::take))
+    (kept, MARK.with(std::cell::Cell::take), RAW_SRV.with(std::cell::Cell::get))
 }
 
 /// Whether the host can make a shader (or unordered access) view of

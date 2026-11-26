@@ -15,15 +15,17 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 /// The root SRV slot (`t255` in [`ROOT_CBV_SPACE`], past every title root
 /// parameter) of the view-stride table: dword `i` is the byte stride of
 /// the buffer view at view-heap index `i` ([`VIEW_STRIDE_BITS`]), with
-/// [`VIEW_INTEGER`] and [`VIEW_SIGNED`] for typed views of integer formats.
+/// [`VIEW_RAW_SRV`], [`VIEW_INTEGER`], and [`VIEW_SIGNED`] as applicable.
 pub const VIEW_STRIDES: u8 = 255;
 /// The bits of a view-stride table dword holding the stride.
-pub const VIEW_STRIDE_BITS: u32 = (1 << 30) - 1;
+pub const VIEW_STRIDE_BITS: u32 = (1 << 29) - 1;
 /// In a view-stride table dword: a typed buffer view of an integer format
 /// (`UINT` or `SINT`), whose 16-bit typed accesses (`_d16`) pass bits.
 pub const VIEW_INTEGER: u32 = 1 << 31;
 /// With [`VIEW_INTEGER`]: a signed (`SINT`) format.
 pub const VIEW_SIGNED: u32 = 1 << 30;
+/// In a view-stride table dword: the host made a raw SRV for this slot.
+pub const VIEW_RAW_SRV: u32 = 1 << 29;
 /// The root SRV slot of the host's view-block table, in [`ROOT_CBV_SPACE`]:
 /// read only by shaders translated for a host that holds the title's view
 /// slots by blocks ([`set_view_heap`]). Its dword `b` is the heap index of
@@ -623,10 +625,9 @@ impl Shader {
             &[index, s, n],
         );
         let h = self.annotate(block, h, props.0, props.1);
-        // Unordered typed, raw and structured buffers (kinds 10-12), and
-        // typed buffers read (their format kind, `Lower::view_word`).
+        // Typed and structured buffers use the view metadata; raw UAVs mark writes.
         let kind = props.0 & 0xFF;
-        if !sampler && (kind == 10 || props.0 & 0x1000 != 0 && (11..=12).contains(&kind)) {
+        if !sampler && (matches!(kind, 10 | 12) || kind == 11 && props.0 & 0x1000 != 0) {
             self.view_index.insert(h, index);
         }
         // Texture shader views (kinds 1-9).

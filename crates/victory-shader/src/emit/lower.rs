@@ -12,7 +12,7 @@ use super::UserData;
 use super::bitcode::{Attr, Bin, Cast, Term, V, pred};
 use super::container::SigElement;
 use super::shader::{
-    Shader, VIEW_BLOCK_SHIFT, VIEW_BLOCKS, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS,
+    Shader, VIEW_BLOCK_SHIFT, VIEW_BLOCKS, VIEW_INTEGER, VIEW_RAW_SRV, VIEW_SIGNED, VIEW_STRIDE_BITS,
     VIEW_STRIDES, flags,
 };
 use crate::ShaderError;
@@ -10135,14 +10135,43 @@ impl<'a> Lower<'a> {
                         return Err("a structured buffer of unknown stride");
                     }
                     let h = self.handle(site, src, false, (12 | u, stride))?;
-                    self.s.op(
-                        c,
-                        "rawBufferLoad.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        139,
-                        &[h, index, off, mask, align],
-                    )
+                    let load = |l: &mut Self, h, at, offset| {
+                        l.s.op(l.cur, "rawBufferLoad.f32", Attr::ReadOnly, l.s.t.res_ret, 139, &[h, at, offset, mask, align])
+                    };
+                    if !uav && let Some(view) = self.s.view_index.get(&h).copied() {
+                        // NVIDIA uses the raw view's addressing, not the structured annotation.
+                        let word = self.view_word(view);
+                        let (flag, zero) = (self.s.m.i32(VIEW_RAW_SRV), self.s.m.i32(0));
+                        let raw = self.s.m.bin(c, Bin::And, word, flag);
+                        let test = self.s.m.cmp(c, pred::NE, raw, zero);
+                        let (raw, structured, join) = (self.s.m.new_block(), self.s.m.new_block(), self.s.m.new_block());
+                        self.s.m.terminate(c, Term::CondBr(test, raw, structured));
+                        self.cur = raw;
+                        let size = self.s.m.i32(stride);
+                        let byte = self.s.m.bin(raw, Bin::Mul, index, size);
+                        let byte = self.s.m.bin(raw, Bin::Add, byte, off);
+                        let (raw_h, byte) = self.raw_view(site, src, byte, 4 * count, (11, 0), false, guard)?;
+                        let rr = load(self, raw_h, byte, iu);
+                        let raw_end = self.cur;
+                        self.s.m.terminate(raw_end, Term::Br(join));
+                        self.cur = structured;
+                        let sr = load(self, h, index, off);
+                        self.s.m.terminate(structured, Term::Br(join));
+                        self.cur = join;
+                        let Some(Operand::Vector { reg, .. }) = *data else {
+                            return Err("a buffer result");
+                        };
+                        for k in 0..count {
+                            let a = self.s.m.extract(raw_end, rr, k);
+                            let b = self.s.m.extract(structured, sr, k);
+                            let v = self.s.m.phi(join, self.s.t.f32);
+                            self.s.m.set_phi(v, vec![(a, raw_end), (b, structured)]);
+                            let v = self.as_int(v);
+                            self.write(inst, Reg::V(reg + k as u8), v, guard);
+                        }
+                        return Ok(());
+                    }
+                    load(self, h, index, off)
                 }
                 None => {
                     let bytes = 4 * count;

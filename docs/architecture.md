@@ -106,6 +106,12 @@ index in one pass. `victory translate`
 runs every shader it finds (containers, SGD5 files) through these and
 lists what they cannot handle yet.
 
+The host may expose a console structured buffer as a raw SRV. It records
+the actual view type beside the console stride in the view-stride table.
+Indexed loads use a byte address (`index * stride + offset`) for a raw
+SRV and keep the structured access otherwise. On NVIDIA, issuing the
+structured load through a raw SRV can read the wrong record or return zeros.
+
 Compute programs that depend on their lane layout (cross-lane reads, lane
 masks read as numbers, LDS shared within one wave) declare the console's
 wave size. A console wave64 program on a host without 64-lane waves

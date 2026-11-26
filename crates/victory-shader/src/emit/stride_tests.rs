@@ -831,3 +831,29 @@ fn d16_x_loads_read_r16_uint_and_r16_float_views() {
         }
     }
 }
+
+#[test]
+fn indexed_structured_reads_reach_raw_host_records() {
+    let mut srv = entry(ResourceType::Srv, 4, 0);
+    srv.stride = 128;
+    let shader = build(
+        &[
+            0xBE84_0300, 0xBE85_0380, 0xF408_0202, 0xFA00_0000, // Light records.
+            0xBE86_0301, 0xBE87_0380, 0xF408_0403, 0xFA00_0000, // Raw result.
+            0x7E00_0281, // v0 = record 1
+            0xE03C_2020, 0x8002_0100, // buffer_load_dwordx3 v[1:3], v0, s[8:11], 0 idxen offset:32
+            0xE07C_0000, 0x8004_0100, // buffer_store_dwordx3 v[1:3], off, s[16:19], 0
+            0xBF81_0000,
+        ],
+        vec![param(RootType::Table, 0), param(RootType::Table, 1)],
+        vec![srv, entry(ResourceType::Uav, 4, 1)],
+        1,
+    );
+    let data: Vec<u32> = (100..164).collect();
+    for (stride, word) in [(Stride::Raw, 128 | super::VIEW_RAW_SRV), (Stride::Structured(128), 128)] {
+        let views = [View::Buffer { data: &data, stride }, View::RawUav(3)];
+        for (label, out) in run_tables(&shader, &views, vec![word, 4]) {
+            assert_eq!(out[0], [140, 141, 142], "{label}: view metadata {word:#x}");
+        }
+    }
+}
