@@ -1,9 +1,12 @@
-# VIctory
+# NVIctory
+
+NVIctory is an unofficial fork of [VIctory](https://github.com/Marvisak/VIctory)
+focused on NVIDIA GPUs. It is not affiliated with or endorsed by NVIDIA.
 
 Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows, from files
 the user supplies.
 
-The title's x86-64 code runs unchanged inside our process; VIctory supplies
+The title's x86-64 code runs unchanged inside our process; NVIctory supplies
 the platform underneath it and converts the title's data, ahead of time where
 it can (shaders and pipelines too, see Getting started) and on first use
 otherwise. See [docs/architecture.md](docs/architecture.md).
