@@ -183,6 +183,7 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
 | `VICTORY_CAPTURE_WORLD=<list>` | with `VICTORY_CAPTURE`, also saves (and with `VICTORY_DUMP_TARGETS` dumps) the frames at these offsets from the first frame that ran 500 draws (the world's first; its number depends on how fast the title loaded) |
 | `VICTORY_DUMP_WRITERS=<hash>,...` | with the two above, also the textures a pipeline containing a listed shader hash writes, the first frame it runs, and for its buffers a log line (dwords changed, dwords not zero) |
+| `VICTORY_UNLIT=<pixel shader hash>` | presents the first RGBA render target of that shader instead of the lit frame; normal presentation on frames that do not submit it. For GTA VI 1.0.2.1, use `89069e131eabee03` to inspect the opaque base-color buffer. This does not add missing materials or draw sky/transparency. |
 | `VICTORY_PEEK=<hex address>[:<bytes>],...` | in listed frames, those bytes of title memory logged after each submission. Listed frames also log targets of 16 texels or fewer as values, each table view's view words and whether its host slot is null, the host copy of every buffer of 64 bytes or fewer a draw reads (at submission and after its list), and each 1D or 3D texture a dispatch writes, read back right after it |
 | `VICTORY_D3D12_DEBUG=1` | host debug layer |
 | `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |

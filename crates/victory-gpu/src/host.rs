@@ -842,6 +842,8 @@ pub(crate) struct HostList {
     /// or writes, and the pipeline that first wrote each (diagnostics).
     #[cfg(feature = "diagnostics")]
     targets: Mutex<Vec<(usize, String)>>,
+    #[cfg(feature = "diagnostics")]
+    unlit: Mutex<Option<std::sync::Arc<crate::resource::HostTexture>>>,
     /// With `VICTORY_GPU_TIMING`: a GPU timestamp before each noted command
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
@@ -1150,6 +1152,8 @@ impl Host {
                 #[cfg(feature = "diagnostics")]
                 targets: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
+                unlit: Mutex::default(),
+                #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
             })
         }
@@ -1417,6 +1421,14 @@ impl Host {
             for work in &list.deferred().after {
                 work();
             }
+        }
+        #[cfg(feature = "diagnostics")]
+        if crate::capture::unlit_writer().is_some()
+            && let Some(target) = runs.iter().rev().find_map(|r| {
+                r.unlit.lock().unwrap_or_else(|e| e.into_inner()).clone()
+            })
+        {
+            *crate::capture::UNLIT_TARGET.lock().unwrap_or_else(|e| e.into_inner()) = Some(target);
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
@@ -1792,6 +1804,8 @@ impl HostList {
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.targets.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        #[cfg(feature = "diagnostics")]
+        self.unlit.lock().unwrap_or_else(|e| e.into_inner()).take();
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
@@ -2037,6 +2051,23 @@ impl HostList {
         let mut targets = self.targets.lock().unwrap_or_else(|e| e.into_inner());
         if !targets.iter().any(|t| t.0 == resource) {
             targets.push((resource, by.to_owned()));
+        }
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn note_unlit(&self, resource: crate::object::This) {
+        let mut target = self.unlit.lock().unwrap_or_else(|e| e.into_inner());
+        if target.is_none() && let Some(copy) = crate::resource::host_copy(resource) {
+            // SAFETY: the host copy keeps the texture live.
+            let desc = unsafe { copy.texture.GetDesc() };
+            if desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+                && matches!(desc.Format.0, 27..=29)
+                && desc.DepthOrArraySize == 1
+                && desc.MipLevels == 1
+                && desc.SampleDesc.Count == 1
+            {
+                *target = Some(copy);
+            }
         }
     }
 

@@ -203,7 +203,9 @@ pub(crate) fn save_read_back(
 ) {
     let f = footprint.Footprint;
     let bgra = match f.Format {
-        DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_R8G8B8A8_UNORM_SRGB => false,
+        DXGI_FORMAT_R8G8B8A8_TYPELESS | DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_R8G8B8A8_UNORM_SRGB => {
+            false
+        }
         DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB => true,
         other => {
             tracing::warn!(format = other.0, "frame not saved: not 8-bit color");
@@ -256,6 +258,20 @@ pub(crate) fn dump_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| folder().is_some() && crate::switch::on("VICTORY_DUMP_TARGETS"))
 }
+
+/// Present RTV 0 of a selected pixel shader, instead of the lit frame.
+pub(crate) fn unlit_writer() -> Option<&'static str> {
+    static WRITER: std::sync::LazyLock<Option<String>> = std::sync::LazyLock::new(|| {
+        let hash = std::env::var("VICTORY_UNLIT").ok()?;
+        (hash.len() == 16 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
+            .then(|| hash.to_ascii_lowercase())
+    });
+    WRITER.as_deref()
+}
+
+/// Taken at each flip. Recording ahead cannot replace a submitted frame's target.
+pub(crate) static UNLIT_TARGET: std::sync::Mutex<Option<std::sync::Arc<crate::resource::HostTexture>>> =
+    std::sync::Mutex::new(None);
 
 /// `VICTORY_DUMP_WRITERS`' hashes not dumped yet.
 static WRITERS: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);

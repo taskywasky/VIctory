@@ -583,6 +583,14 @@ impl State {
             unsafe { l.SetPipelineState(&p.pso) };
             (self.host_pipeline, self.host_roots[1]) = (p.pso.as_raw() as usize, 0);
         }
+        #[cfg(feature = "diagnostics")]
+        if crate::capture::unlit_writer().is_some_and(|hash| {
+            p.stages.iter().any(|s| s.shader.stage == "pixel" && s.shader.hash == hash)
+        })
+            && let Some(&target) = self.targets.first()
+        {
+            list.note_unlit(target as This);
+        }
         true
     }
 

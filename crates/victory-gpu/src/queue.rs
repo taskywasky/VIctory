@@ -530,6 +530,10 @@ extern "system" fn present(
             crate::capture::dump_targets(frame);
         }
     }
+    #[cfg(all(windows, feature = "diagnostics"))]
+    let unlit = crate::capture::unlit_writer().and_then(|_| {
+        crate::capture::UNLIT_TARGET.lock().unwrap_or_else(|e| e.into_inner()).take()
+    });
     #[cfg(windows)]
     if planes > 0
         // SAFETY: the title passes `planes` plane descriptions.
@@ -541,6 +545,13 @@ extern "system" fn present(
         && let Some(texture) = crate::resource::host_resource(resource)
         && let Some(host) = crate::host::host()
     {
+        #[cfg(feature = "diagnostics")]
+        if let Some(unlit) = unlit
+            && host.present(&unlit.texture, unlit.state.load(Ordering::Relaxed), frame).is_some()
+        {
+            let _ = crate::draw::take_frame();
+            return S_OK;
+        }
         const COPY_SOURCE: u32 = 0x800;
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
