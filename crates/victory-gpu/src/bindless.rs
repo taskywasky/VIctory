@@ -159,13 +159,7 @@ fn seen(view: &View) -> Option<Seen> {
         return crate::texture::title_written(&texture.texture).then_some(Seen::Texture(*resource));
     }
     // The copy the host view reads.
-    let (shadow, address, len) = match *view {
-        View::Constant(address, size) => {
-            let len = u64::from(size);
-            ((len > 0).then(|| crate::shadow::find(address, len)).flatten()?, address, len)
-        }
-        _ => crate::descriptor::host::view_copy(view)?,
-    };
+    let (shadow, address, len) = crate::descriptor::host::view_copy(view)?;
     let uav = matches!(view, View::Unordered(..) | View::Placed(true, ..));
     if len == 0 {
         return None;
@@ -555,6 +549,54 @@ void main(uint3 id : SV_DispatchThreadID) {
     }
 
     const LINEAR: u32 = 0x100;
+
+    #[test]
+    fn constant_view_uses_the_copy_of_its_whole_dwords() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let pool = crate::watch::tests::pool(1);
+        let address = pool + 128;
+        crate::shadow::register(pool, pool as u64, PAGE_BYTES as u64);
+        crate::shadow::register(address, address as u64, 4);
+        let view = View::Constant(address as u64, 7);
+        let heap = crate::descriptor::host::HostHeap::new(false, 1).unwrap();
+        heap.make_at(0, &view);
+        heap.viewed.set(0, Some(&view), true);
+        let (copy, start, len) = crate::descriptor::host::view_copy(&view).unwrap();
+        assert_eq!((copy.range(), start, len), ((address as u64, 4), address as u64, 4));
+        let ranges = heap.viewed.ranges();
+        assert_eq!(ranges.len(), 1);
+        assert!(Arc::ptr_eq(&ranges[0].0, &copy));
+        let (root, pso) = compile(r#"
+#define RS "DescriptorTable(SRV(t0)), UAV(u1)"
+ByteAddressBuffer src : register(t0);
+RWByteAddressBuffer dst : register(u1);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() { dst.Store(0, src.Load(0)); }
+"#);
+        let (out, data) = host.shared_buffer(256).unwrap();
+        let list = host.new_list().unwrap();
+        // SAFETY: an open list and live objects.
+        unsafe {
+            list.list.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetComputeRootDescriptorTable(0, heap.gpu(0));
+            list.list.SetComputeRootUnorderedAccessView(1, out.GetGPUVirtualAddress());
+            list.list.SetPipelineState(&pso);
+            list.list.Dispatch(1, 1, 1);
+        }
+        list.defer_heap(&heap.viewed);
+        list.close();
+        // SAFETY: a dword inside our allocated pool.
+        unsafe { (address as *mut u32).write_volatile(0x7654_3210) };
+        host.execute(&[&list]);
+        // SAFETY: the mapped output, after the dispatch completed.
+        assert_eq!(unsafe { (data as *const u32).read() }, 0x7654_3210);
+        crate::shadow::unregister(address, address as u64);
+        crate::shadow::unregister(pool, pool as u64);
+    }
 
     /// A copy's hull is its live ranges' first start to last end, kept as
     /// slots come and go; a copy no slot views any more has none.

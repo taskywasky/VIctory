@@ -71,6 +71,7 @@ fn build() -> &'static [u8; 32] {
             ENCODING,
             limit,
             victory_shader::emit::host_wave_max(),
+            victory_shader::emit::trace_texture_writes(),
         )
     })
 }
@@ -78,12 +79,13 @@ fn build() -> &'static [u8; 32] {
 /// This file, whose `encode` and `decode` define the entries.
 const ENCODING: &[u8] = include_bytes!("shader_cache.rs");
 
-fn key(translator: &str, encoding: &[u8], limit: u32, wave: u32) -> [u8; 32] {
+fn key(translator: &str, encoding: &[u8], limit: u32, wave: u32, texture_writes: bool) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(translator.as_bytes());
     h.update(blake3::hash(encoding).as_bytes());
     h.update(&limit.to_le_bytes());
     h.update(&wave.to_le_bytes());
+    h.update(&[u8::from(texture_writes)]);
     *h.finalize().as_bytes()
 }
 
@@ -471,12 +473,13 @@ mod tests {
     /// written before it is read.
     #[test]
     fn the_key_covers_translator_encoding_and_settings() {
-        let k = key("0123456789abcdef", b"encoding", 1 << 20, 64);
-        assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20, 64));
-        assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20, 64));
-        assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20, 64));
-        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19, 64));
-        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 20, 32));
+        let k = key("0123456789abcdef", b"encoding", 1 << 20, 64, false);
+        assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20, 64, false));
+        assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20, 64, false));
+        assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20, 64, false));
+        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19, 64, false));
+        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 20, 32, false));
+        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 20, 64, true));
         // A host with smaller view heaps has entries of its own.
         let views = victory_shader::emit::HEAP_VIEWS;
         assert_eq!(host_build(&k, views, false), k);
@@ -491,7 +494,8 @@ mod tests {
                 victory_shader::SOURCE_HASH,
                 ENCODING,
                 victory_shader::emit::loop_limit(),
-                victory_shader::emit::host_wave_max()
+                victory_shader::emit::host_wave_max(),
+                victory_shader::emit::trace_texture_writes()
             )
         );
         // The encoding part is this file as built.

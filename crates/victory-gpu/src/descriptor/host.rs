@@ -686,6 +686,8 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
     /// host cannot.
     pub(crate) fn make_at(&self, index: u32, view: &View) {
+        #[cfg(feature = "diagnostics")]
+        let candidate = texture_candidate_before(self.cpu, index, None, Some(view));
         let (kept, mark, raw) = make_marked(view, self.cpu(index));
         if kept.is_none() {
             null_for(view, self.cpu(index));
@@ -693,6 +695,8 @@ impl HostHeap {
         self.keep(index, kept.flatten());
         self.set_stride(index, Some(view), raw);
         self.set_mark(index, mark);
+        #[cfg(feature = "diagnostics")]
+        texture_candidate_after(self.cpu, index, candidate);
         self.note_address(index, Some(view));
     }
 
@@ -702,6 +706,8 @@ impl HostHeap {
     /// for unordered access to a buffer shaders cannot write.
     pub(crate) fn raw_view_at(&self, index: u32, buffer: Option<&ID3D12Resource>, first: u64, bytes: u64, uav: bool) {
         let Some(host) = host() else { return };
+        #[cfg(feature = "diagnostics")]
+        let candidate = texture_candidate_before(self.cpu, index, None, None);
         let writable = |b: &ID3D12Resource| {
             // SAFETY: a live buffer.
             unsafe { b.GetDesc() }.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 != 0
@@ -751,10 +757,14 @@ impl HostHeap {
         self.keep(index, buffer.map(|b| (b.clone(), None)));
         self.write_stride(index, 4 | if !uav && buffer.is_some() { victory_shader::emit::VIEW_RAW_SRV } else { 0 });
         self.set_mark(index, None);
+        #[cfg(feature = "diagnostics")]
+        texture_candidate_after(self.cpu, index, candidate);
     }
 
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
     pub(crate) fn make_null(&self, index: u32) {
+        #[cfg(feature = "diagnostics")]
+        let candidate = texture_candidate_before(self.cpu, index, None, None);
         if self.sampler {
             self.null_sampler(index);
         } else {
@@ -768,6 +778,8 @@ impl HostHeap {
         if index < self.count {
             self.viewed.set(index, None, false);
         }
+        #[cfg(feature = "diagnostics")]
+        texture_candidate_after(self.cpu, index, candidate);
     }
 
     /// Enters the byte stride of `view` (0 for none or not a buffer view)
@@ -906,6 +918,11 @@ impl HostHeap {
                 },
             },
         };
+        #[cfg(feature = "diagnostics")]
+        let candidates = [
+            texture_candidate_before(self.cpu, index, None, None),
+            texture_candidate_before(self.cpu, index + 1, None, None),
+        ];
         // SAFETY: slots of our heap; the buffer is live (or none: null views).
         unsafe {
             host.device
@@ -920,6 +937,10 @@ impl HostHeap {
         // Writes through these are title memory's, marked in its page table.
         self.set_mark(index, None);
         self.set_mark(index + 1, None);
+        #[cfg(feature = "diagnostics")]
+        for (slot, candidate) in [index, index + 1].into_iter().zip(candidates) {
+            texture_candidate_after(self.cpu, slot, candidate);
+        }
     }
 
     /// The shader-visible handle of slot `index`.
@@ -1050,6 +1071,8 @@ impl HostHeap {
                 crate::shadow::forget_read(slot);
             }
             self.note_address(slot, Some(&view));
+            #[cfg(feature = "diagnostics")]
+            let candidate = texture_candidate_before(self.cpu, slot, Some(index), Some(&view));
             made[slot as usize] = key;
             let (kept, mark, raw) = if later {
                 (None, None, false)
@@ -1063,9 +1086,13 @@ impl HostHeap {
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(slot));
             }
+            #[cfg(feature = "diagnostics")]
+            trace_heap_uav(self as *const Self as usize, index, slot, &view, kept.is_some());
             if !self.sampler {
                 self.viewed.set(slot, Some(&view), kept.is_some());
             }
+            #[cfg(feature = "diagnostics")]
+            texture_candidate_after(self.cpu, slot, candidate);
             self.keep(slot, kept.flatten());
         }
         Some(view)
@@ -1120,6 +1147,8 @@ impl HostHeap {
         let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         for index in slots {
             let key = made.get(index as usize).copied().unwrap_or(0);
+            #[cfg(feature = "diagnostics")]
+            let candidate = texture_candidate_before(self.cpu, index, None, None);
             let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten();
             match &view {
                 Some(v) => null_for(v, self.cpu(index)),
@@ -1130,6 +1159,8 @@ impl HostHeap {
                 self.viewed.set(index, view.as_ref(), false);
                 crate::shadow::forget_read(index);
             }
+            #[cfg(feature = "diagnostics")]
+            texture_candidate_after(self.cpu, index, candidate);
         }
     }
 
@@ -1177,6 +1208,136 @@ impl HostHeap {
     #[cfg(test)]
     pub(crate) fn kept(&self, index: u32) -> bool {
         self.kept.lock().unwrap_or_else(|e| e.into_inner())[index as usize].is_some()
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TextureCandidate {
+    heap: usize,
+    slot: u32,
+    title_slot: Option<u32>,
+    resource: usize,
+    address: u64,
+    len: Option<u64>,
+}
+
+#[cfg(feature = "diagnostics")]
+#[derive(Default)]
+struct CandidateSlot {
+    candidates: Vec<TextureCandidate>,
+    in_flight: usize,
+    overlapped: bool,
+}
+
+#[cfg(feature = "diagnostics")]
+#[derive(Default)]
+struct TextureCandidates {
+    current: std::collections::BTreeMap<(usize, u32), CandidateSlot>,
+    active: Option<Vec<TextureCandidate>>,
+}
+
+#[cfg(feature = "diagnostics")]
+impl TextureCandidates {
+    fn begin(&mut self) {
+        self.active = Some(self.current.values().flat_map(|slot| slot.candidates.iter().cloned()).collect());
+    }
+
+    fn before(&mut self, heap: usize, slot: u32, candidate: Option<&TextureCandidate>) {
+        let entry = self.current.entry((heap, slot)).or_default();
+        entry.overlapped |= entry.in_flight != 0;
+        entry.in_flight += 1;
+        if let Some(candidate) = candidate {
+            if !entry.candidates.contains(candidate) {
+                entry.candidates.push(candidate.clone());
+            }
+            if let Some(active) = &mut self.active {
+                active.push(candidate.clone());
+            }
+        }
+    }
+
+    fn after(&mut self, heap: usize, slot: u32, candidate: Option<TextureCandidate>) {
+        let key = (heap, slot);
+        let entry = self.current.get_mut(&key).expect("descriptor update started");
+        entry.in_flight -= 1;
+        if entry.in_flight == 0 {
+            if !entry.overlapped {
+                entry.candidates = candidate.into_iter().collect();
+            }
+            entry.overlapped = false;
+            if entry.candidates.is_empty() {
+                self.current.remove(&key);
+            }
+        }
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+static TEXTURE_CANDIDATES: std::sync::LazyLock<Mutex<TextureCandidates>> =
+    std::sync::LazyLock::new(|| Mutex::new(TextureCandidates::default()));
+
+#[cfg(feature = "diagnostics")]
+fn texture_candidate_before(heap: usize, slot: u32, title_slot: Option<u32>, view: Option<&View>) -> Option<TextureCandidate> {
+    if !victory_shader::emit::trace_texture_writes() {
+        return None;
+    }
+    let candidate = view.and_then(heap_uav_range).and_then(|(resource, address, len)| {
+        let selected = crate::resource::trace_texture_memory()?;
+        let matches = match len {
+            Some(len) => crate::resource::trace_texture_overlap(address, len),
+            None => address <= selected || crate::resource::trace_texture_overlap(address, 1),
+        };
+        matches.then_some(TextureCandidate { heap, slot, title_slot, resource, address, len })
+    });
+    TEXTURE_CANDIDATES.lock().unwrap_or_else(|e| e.into_inner()).before(heap, slot, candidate.as_ref());
+    candidate
+}
+
+#[cfg(feature = "diagnostics")]
+fn texture_candidate_after(heap: usize, slot: u32, candidate: Option<TextureCandidate>) {
+    if victory_shader::emit::trace_texture_writes() {
+        TEXTURE_CANDIDATES.lock().unwrap_or_else(|e| e.into_inner()).after(heap, slot, candidate);
+    }
+}
+
+/// Snapshot every live heap and retain matching changes until the fence.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn begin_texture_writes() {
+    TEXTURE_CANDIDATES.lock().unwrap_or_else(|e| e.into_inner()).begin();
+}
+
+/// Report only slot intersections; the bitmap does not identify a heap or command.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn end_texture_writes(first_submission: u64, last_submission: u64, slots: Option<&[u32]>) {
+    let candidates = TEXTURE_CANDIDATES.lock().unwrap_or_else(|e| e.into_inner()).active.take().unwrap_or_default();
+    let Some(slots) = slots else { return };
+    let mut seen = Vec::new();
+    for candidate in candidates {
+        if slots.binary_search(&candidate.slot).is_err() || seen.contains(&candidate) {
+            continue;
+        }
+        tracing::info!(
+            first_submission,
+            last_submission,
+            heap_cpu = format_args!("{:#x}", candidate.heap),
+            host_slot = candidate.slot,
+            title_slot = ?candidate.title_slot,
+            resource = format_args!("{:#x}", candidate.resource),
+            address = format_args!("{:#x}", candidate.address),
+            len = ?candidate.len,
+            "marked texture-write slot: submission-level descriptor candidate, not proof of heap, descriptor, command, or writer"
+        );
+        seen.push(candidate);
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+impl Drop for HostHeap {
+    fn drop(&mut self) {
+        if victory_shader::emit::trace_texture_writes() {
+            TEXTURE_CANDIDATES.lock().unwrap_or_else(|e| e.into_inner()).current.retain(|&(heap, _), _| heap != self.cpu);
+        }
     }
 }
 
@@ -1424,7 +1585,14 @@ pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
 /// The host copy a buffer view's bytes are in (the one its host view
 /// reads, [`crate::shadow::for_view`]) and the view's title range.
 pub(crate) fn view_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> {
-    let (address, len) = buffer_range(view)?;
+    let (address, len) = match *view {
+        View::Constant(address, size) => {
+            let shadow = crate::shadow::find(address, u64::from(size))?;
+            let bytes = u64::from(size).min(shadow.left(address));
+            (address, bytes / 4 * 4)
+        }
+        _ => buffer_range(view)?,
+    };
     let (shadow, _) = crate::shadow::for_view(address, len, u64::from(view_stride(view)))?;
     Some((shadow, address, len))
 }
@@ -1442,9 +1610,64 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
         crate::resource::element(desc.Format.0 as u32)?.0
     };
     Some((
-        base + buffer.FirstElement * element,
-        u64::from(buffer.NumElements) * element,
+        base.checked_add(buffer.FirstElement.checked_mul(element)?)?,
+        u64::from(buffer.NumElements).checked_mul(element)?,
     ))
+}
+
+/// A heap UAV's title resource, address and exact known view or texture size.
+#[cfg(feature = "diagnostics")]
+fn heap_uav_range(view: &View) -> Option<(usize, u64, Option<u64>)> {
+    match view {
+        View::Unordered(resource, _, _) => {
+            if let Some((address, desc)) = crate::resource::texture_memory(*resource as crate::object::This) {
+                let len = crate::resource::texture_layout(&desc).map(|layout| layout.size);
+                Some((*resource, address as u64, len))
+            } else {
+                let (address, len) = buffer_range(view)?;
+                Some((*resource, address, Some(len)))
+            }
+        }
+        View::Placed(true, resource, _) if resource[0] == 1 => {
+            let (address, len) = buffer_range(view)?;
+            Some((0, address, Some(len)))
+        }
+        View::Placed(true, resource, desc) => {
+            let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+            // SAFETY: the words have the layout and size of ResourceDesc.
+            let desc = unsafe { resource.as_ptr().cast::<crate::resource::ResourceDesc>().read_unaligned() };
+            let len = crate::resource::texture_layout(&desc).map(|layout| layout.size);
+            Some((0, address, len))
+        }
+        _ => None,
+    }
+}
+
+/// Descriptor creation is a potential binding, not evidence of a GPU write.
+#[cfg(feature = "diagnostics")]
+fn trace_heap_uav(heap: usize, title_slot: u32, host_slot: u32, view: &View, made: bool) {
+    use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+    static LOGGED: AtomicU32 = AtomicU32::new(0);
+
+    let Some(selected) = crate::resource::trace_texture_memory() else { return };
+    let Some((resource, address, len)) = heap_uav_range(view) else { return };
+    let matches = match len {
+        Some(len) => crate::resource::trace_texture_overlap(address, len),
+        None => address == selected,
+    };
+    if matches && LOGGED.fetch_update(Relaxed, Relaxed, |n| (n < 256).then_some(n + 1)).is_ok() {
+        tracing::info!(
+            heap = format_args!("{heap:#x}"),
+            title_slot,
+            host_slot,
+            resource = format_args!("{resource:#x}"),
+            address = format_args!("{address:#x}"),
+            len = ?len,
+            made,
+            selected = format_args!("{selected:#x}"),
+            "heap UAV potential binding (not an observed GPU write; unknown length means same-start only)"
+        );
+    }
 }
 
 /// The host resource a slot made by [`make`] views, if any, and the view's
@@ -2043,6 +2266,51 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn texture_candidates_include_inflight_replacements_and_keep_heaps_distinct() {
+        let a = TextureCandidate { heap: 1, slot: 7, title_slot: Some(70), resource: 1, address: 10, len: Some(4) };
+        let b = TextureCandidate { heap: 2, slot: 7, title_slot: Some(8), resource: 2, address: 20, len: None };
+        let c = TextureCandidate { heap: 1, slot: 7, title_slot: None, resource: 3, address: 30, len: Some(4) };
+        let mut candidates = TextureCandidates::default();
+        candidates.before(1, 7, Some(&a));
+        candidates.after(1, 7, Some(a.clone()));
+        candidates.before(2, 7, Some(&b));
+        candidates.after(2, 7, Some(b.clone()));
+        candidates.before(1, 7, Some(&c));
+        candidates.begin();
+        candidates.after(1, 7, Some(c.clone()));
+        candidates.before(2, 7, None);
+        candidates.after(2, 7, None);
+        let active = candidates.active.take().unwrap();
+        assert!(active.contains(&a) && active.contains(&b) && active.contains(&c));
+        candidates.begin();
+        assert_eq!(candidates.active.take().unwrap(), vec![c.clone()]);
+        // Overlapping updates can finish out of order, so neither is discarded.
+        candidates.before(1, 7, Some(&a));
+        candidates.before(1, 7, Some(&b));
+        candidates.after(1, 7, Some(b.clone()));
+        candidates.after(1, 7, Some(a.clone()));
+        candidates.begin();
+        let active = candidates.active.take().unwrap();
+        assert!(active.contains(&a) && active.contains(&b) && active.contains(&c));
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn heap_uav_range_uses_the_placed_buffer_view_window() {
+        let mut resource = [0; 14];
+        resource[0] = 1;
+        let mut desc = [0; 16];
+        desc[..10].copy_from_slice(&[0, 1, 2, 0, 64, 16, 0, 0, 0, 0]);
+        desc[10] = 0x1000;
+        assert_eq!(heap_uav_range(&View::Placed(true, resource, desc)), Some((0, 0x1020, Some(1024))));
+        assert_eq!(heap_uav_range(&View::Placed(false, resource, desc)), None);
+        desc[2] = u32::MAX;
+        desc[3] = u32::MAX;
+        assert_eq!(heap_uav_range(&View::Placed(true, resource, desc)), None);
+    }
 
     /// Typed buffer views of integer formats carry their kind in the
     /// view-stride table; float, normalized, raw and structured ones none.

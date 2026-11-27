@@ -57,6 +57,8 @@ pub mod shader_cache;
 #[cfg(windows)]
 mod shadow;
 pub mod signature;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod snapshot;
 mod switch;
 #[cfg(windows)]
 mod tdr;

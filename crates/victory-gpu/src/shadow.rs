@@ -65,7 +65,7 @@ fn pooled(n: usize) -> Vec<u8> {
     let fit = pool
         .iter()
         .enumerate()
-        .filter(|(_, v)| v.capacity() >= n)
+        .filter(|(_, v)| v.capacity() >= n && v.capacity() <= n.saturating_mul(4).max(1 << 20))
         .min_by_key(|(_, v)| v.capacity())
         .map(|(i, _)| i);
     let mut v = match fit {
@@ -312,12 +312,29 @@ impl Shadow {
         }
         let start = segments.get(first).filter(|_| first < last).map_or(from, |s| s.0.min(from));
         let end = segments[first..last].last().map_or(to, |(at, bytes)| (at + bytes.len()).max(to));
+        let append = last == first + 1 && segments[first].0 == start;
+        #[cfg(feature = "diagnostics")]
+        let copied = if append && segments[first].1.capacity() >= end - start {
+            end - (segments[first].0 + segments[first].1.len())
+        } else {
+            end - start
+        };
         #[cfg(feature = "diagnostics")]
         let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SnapshotUs);
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::SnapshotBytes, (end - start) as u64);
+        crate::copystat::add(crate::copystat::C::SnapshotBytes, copied as u64);
         #[cfg(feature = "diagnostics")]
-        crate::copystat::snapshot(self.start, self.len, (end - start) as u64);
+        crate::copystat::snapshot(self.start, self.len, copied as u64);
+        if append {
+            let (at, bytes) = &mut segments[first];
+            if bytes.capacity() < end - *at {
+                // Bound spare capacity while amortizing repeated extensions.
+                let target = bytes.len().saturating_mul(2).min(POOL_BYTES).min(self.len as usize - *at).max(end - *at);
+                bytes.reserve_exact(target - bytes.len());
+            }
+            bytes.extend_from_slice(host(*at + bytes.len(), end));
+            return;
+        }
         // Parts newly covered from the copy, the rest as it was taken.
         let mut grown = pooled(end - start);
         let mut at = start;
@@ -743,11 +760,12 @@ fn bitmap(memory: bool) -> Option<&'static Bitmap> {
     static BITMAPS: [std::sync::OnceLock<Option<Bitmap>>; 2] = [const { std::sync::OnceLock::new() }; 2];
     BITMAPS[usize::from(memory)]
         .get_or_init(|| {
-            // Written pages, then one read mark per heap index.
-            let bits = victory_shader::emit::VIEW_READS + victory_shader::emit::HEAP_VIEWS;
-            let bytes = u64::from(bits / 8);
+            // Written pages, read slots, then independently cleared texture writes.
+            let bits = victory_shader::emit::VIEW_TEXTURE_WRITES
+                + if victory_shader::emit::trace_texture_writes() { victory_shader::emit::HEAP_VIEWS } else { 0 };
+            let bytes = u64::from(bits.div_ceil(8));
             let (buffer, data) = host()?.shared_buffer(bytes)?;
-            crate::host::name(&buffer, || "views' written pages and read slots".into());
+            crate::host::name(&buffer, || "views' written pages, read slots, and texture writes".into());
             // SAFETY: our mapped buffer of `bytes` bytes.
             unsafe { std::ptr::write_bytes(data, 0, bytes as usize) };
             // SAFETY: a live buffer.
@@ -835,6 +853,39 @@ pub(crate) fn reads_since() -> Vec<u32> {
     slots.sort_unstable();
     slots.dedup();
     slots
+}
+
+#[cfg(feature = "diagnostics")]
+const _: () = assert!(victory_shader::emit::VIEW_TEXTURE_WRITES % 32 == 0 && victory_shader::emit::HEAP_VIEWS % 32 == 0);
+
+/// Takes only the texture-write range from both bitmaps after a verified fence.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn take_texture_writes() -> Vec<u32> {
+    if !victory_shader::emit::trace_texture_writes() {
+        return Vec::new();
+    }
+    let words = (victory_shader::emit::HEAP_VIEWS / 32) as usize;
+    let first = (victory_shader::emit::VIEW_TEXTURE_WRITES / 32) as usize;
+    let mut slots = Vec::new();
+    for b in [false, true].into_iter().filter_map(bitmap) {
+        // SAFETY: the caller verified completion while holding the submission lock.
+        let bits = unsafe { std::slice::from_raw_parts_mut((b.data as *mut u32).add(first), words) };
+        take_texture_write_words(bits, &mut slots);
+    }
+    slots.sort_unstable();
+    slots.dedup();
+    slots
+}
+
+#[cfg(feature = "diagnostics")]
+fn take_texture_write_words(bits: &mut [u32], slots: &mut Vec<u32>) {
+    for (w, word) in bits.iter_mut().enumerate() {
+        let mut x = std::mem::take(word);
+        while x != 0 {
+            slots.push(w as u32 * 32 + x.trailing_zeros());
+            x &= x - 1;
+        }
+    }
 }
 
 /// Heap slot `slot` now holds a texture view left null: its next read is
@@ -1019,8 +1070,16 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let start = address & !(WINDOW - 1);
     let len = end.next_multiple_of(WINDOW) - start;
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(shadow) = map.get(&(start, len)) {
-        return Some(shadow.clone());
+    // Any copy already holding the range: a range across a window edge
+    // otherwise gets a second copy of the same windows, never freed.
+    if let Some(shadow) = map
+        .range(..=(start, u64::MAX))
+        .rev()
+        .take(64)
+        .find(|&(&(at, n), _)| at + n >= end)
+        .map(|(_, s)| s.clone())
+    {
+        return Some(shadow);
     }
     let (buffer, data) = host()?.shared_buffer(len)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
@@ -1078,9 +1137,24 @@ pub(crate) fn log_views(frames: f64) {
         let a = arena();
         // SAFETY: live buffers.
         let size = |c: &(ID3D12Resource, usize, u64, BTreeMap<u64, u64>)| unsafe { c.0.GetDesc() }.Width;
-        let held: u64 = a.chunks.iter().map(|c| size(c) - c.3.values().sum::<u64>()).sum();
-        (a.chunks.len(), held)
+        let held: u64 = a.chunks.iter().flatten().map(|c| size(c) - c.3.values().sum::<u64>()).sum();
+        (a.chunks.iter().flatten().count(), held)
     };
+    let census = |s: &mut (usize, u64), shadow: &Shadow| {
+        s.0 += 1;
+        s.1 += shadow.len;
+    };
+    let mut copies = (0, 0);
+    buffers().values().filter_map(|e| e.shadow.as_deref()).for_each(|s| census(&mut copies, s));
+    let mut windows = (0, 0);
+    LOOSE.lock().unwrap_or_else(|e| e.into_inner()).values().for_each(|s| census(&mut windows, s));
+    tracing::info!(
+        "host copies of title memory: buffers {} ({:.0} MB), loose windows {} ({:.0} MB)",
+        copies.0,
+        copies.1 as f64 / 1e6,
+        windows.0,
+        windows.1 as f64 / 1e6
+    );
     if asks > 0 {
         tracing::info!(
             "buffer views off their copy's elements: {:.0} asked for/frame, {:.0} copies made/frame ({:.1} KB), largest {largest} bytes, {live} live in {chunks} shared buffers ({:.1} MB held)",
@@ -1142,9 +1216,9 @@ struct Slice {
 /// of memory each (~5,000 live).
 #[derive(Default)]
 struct Arena {
-    /// Each buffer, its mapping and host address, and its free runs
-    /// (offset → bytes).
-    chunks: Vec<(ID3D12Resource, usize, u64, BTreeMap<u64, u64>)>,
+    /// Each live buffer, its mapping and host address, and its free runs
+    /// (offset → bytes). Empty slots keep live slices' indices stable.
+    chunks: Vec<Option<(ID3D12Resource, usize, u64, BTreeMap<u64, u64>)>>,
 }
 
 /// Bytes of each arena buffer (a larger copy gets one of its size).
@@ -1174,7 +1248,7 @@ impl Arena {
                 (start + len <= at + n).then_some((at, n, start))
             })
         };
-        let found = self.chunks.iter().enumerate().find_map(|(c, chunk)| fits(&chunk.3).map(|f| (c, f)));
+        let found = self.chunks.iter().enumerate().find_map(|(c, chunk)| fits(&chunk.as_ref()?.3).map(|f| (c, f)));
         let (chunk, (at, n, start)) = match found {
             Some(found) => found,
             None => {
@@ -1184,12 +1258,18 @@ impl Arena {
                 // SAFETY: a live buffer.
                 let gpu = unsafe { buffer.GetGPUVirtualAddress() };
                 let free = BTreeMap::from([(0, size)]);
-                self.chunks.push((buffer, data as usize, gpu, free));
-                let c = self.chunks.len() - 1;
-                (c, fits(&self.chunks[c].3)?)
+                let chunk = Some((buffer, data as usize, gpu, free));
+                let c = if let Some(c) = self.chunks.iter().position(Option::is_none) {
+                    self.chunks[c] = chunk;
+                    c
+                } else {
+                    self.chunks.push(chunk);
+                    self.chunks.len() - 1
+                };
+                (c, fits(&self.chunks[c].as_ref()?.3)?)
             }
         };
-        let (buffer, data, gpu, free) = &mut self.chunks[chunk];
+        let (buffer, data, gpu, free) = self.chunks[chunk].as_mut()?;
         free.remove(&at);
         if start > at {
             free.insert(at, start - at);
@@ -1201,9 +1281,10 @@ impl Arena {
         Some((buffer.clone(), (*data + start as usize) as *mut u8, *gpu + start, slice))
     }
 
-    /// A run goes back, joined to its free neighbours.
+    /// A run goes back, joined to its free neighbours; keep one empty
+    /// regular buffer for reuse, but release excess and oversized buffers.
     fn give_back(&mut self, slice: Slice) {
-        let Some((_, _, _, free)) = self.chunks.get_mut(slice.chunk) else { return };
+        let Some(Some((buffer, _, _, free))) = self.chunks.get_mut(slice.chunk) else { return };
         let (mut at, mut n) = (slice.offset, slice.len);
         if let Some((&before, &m)) = free.range(..at).next_back()
             && before + m == at
@@ -1215,6 +1296,25 @@ impl Arena {
             n += m;
         }
         free.insert(at, n);
+        if at == 0 && free.len() == 1 {
+            // SAFETY: the buffer is live.
+            let size = unsafe { buffer.GetDesc() }.Width;
+            if n == size {
+                let spare = size > CHUNK || self.chunks.iter().enumerate().any(|(i, chunk)| {
+                    i != slice.chunk && chunk.as_ref().is_some_and(|(buffer, _, _, free)| {
+                        if free.len() != 1 || !free.contains_key(&0) {
+                            return false;
+                        }
+                        // SAFETY: the buffer is live.
+                        let size = unsafe { buffer.GetDesc() }.Width;
+                        size == CHUNK && free.get(&0) == Some(&size)
+                    })
+                });
+                if spare {
+                    self.chunks[slice.chunk] = None;
+                }
+            }
+        }
     }
 }
 
@@ -1269,6 +1369,26 @@ pub(crate) mod tests {
         // SAFETY: a bit of the mapped bitmap; no submission runs (the caller
         // holds the submission lock).
         unsafe { *(b.data as *mut u32).add((bit / 32) as usize) |= 1 << (bit % 32) };
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn mark_texture_write(memory: bool, slot: u32) {
+        let b = bitmap(memory).expect("a host GPU");
+        let bit = victory_shader::emit::VIEW_TEXTURE_WRITES + slot;
+        // SAFETY: the caller holds the submission lock and slot is in range.
+        unsafe { *(b.data as *mut u32).add((bit / 32) as usize) |= 1 << (bit % 32) };
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn texture_write_words_clear_only_the_selected_slice() {
+        let mut bitmap = [0x80, 0x8000_0001, 0x8000_0000, 0x40];
+        let mut slots = Vec::new();
+        take_texture_write_words(&mut bitmap[1..3], &mut slots);
+        assert_eq!(slots, [0, 31, 63]);
+        assert_eq!(bitmap, [0x80, 0, 0, 0x40]);
+        take_texture_write_words(&mut bitmap[1..3], &mut slots);
+        assert_eq!(slots, [0, 31, 63]);
     }
 
     /// The title writes a constant under a range an earlier list of the
@@ -1389,10 +1509,34 @@ pub(crate) mod tests {
             arena.give_back(s);
         }
         assert_eq!(arena.chunks.len(), 1);
-        assert_eq!(arena.chunks[0].3.len(), 1, "one free run again");
+        assert_eq!(arena.chunks[0].as_ref().unwrap().3.len(), 1, "one free run again");
         // Larger than a buffer: one of its own.
         let (_, _, _, d) = arena.take(CHUNK + 1, 4).unwrap();
         assert_eq!((arena.chunks.len(), d.chunk), (2, 1));
+    }
+
+    #[test]
+    fn arena_releases_empty_excess_and_oversized_buffers_without_moving_live_slices() {
+        if host().is_none() {
+            return;
+        }
+        let mut arena = Arena::default();
+        let (_, _, _, a) = arena.take(CHUNK / 2 + 1, 4).unwrap();
+        let (_, _, _, b) = arena.take(CHUNK / 2 + 1, 4).unwrap();
+        assert_ne!(a.chunk, b.chunk);
+        arena.give_back(a);
+        assert!(arena.chunks[a.chunk].is_some());
+        arena.give_back(b);
+        assert!(arena.chunks[b.chunk].is_none(), "only one empty regular buffer is retained");
+
+        let (_, _, _, live) = arena.take(CHUNK, 4).unwrap();
+        let (_, _, _, large) = arena.take(CHUNK + 1, 4).unwrap();
+        assert_eq!(large.chunk, b.chunk, "vacant indices are reused");
+        arena.give_back(large);
+        assert!(arena.chunks[large.chunk].is_none(), "oversized buffers are released");
+        assert!(arena.chunks[live.chunk].is_some(), "live slices retain their chunk");
+        arena.give_back(live);
+        assert!(arena.chunks[live.chunk].is_some(), "one regular buffer remains reusable");
     }
 
     /// Ranges shaders write far apart are kept apart (not the copy between
@@ -1428,6 +1572,70 @@ pub(crate) mod tests {
         let title = |at: usize| unsafe { (at as *const u8).read_volatile() };
         assert_eq!([title(p + 20), title(p + 21), title(p + 22), title(p + PAGE + 5)], [1, 2, 3, 9]);
         assert_eq!(bytes(&copy), 0, "the snapshot goes with the last range");
+        unregister(p, p as u64);
+    }
+
+    #[test]
+    fn extending_a_snapshot_keeps_its_original_bytes_for_copy_back() {
+        let p = crate::watch::tests::pool(2);
+        let len = 2 * PAGE;
+        register(p, p as u64, len as u64);
+        let Some(copy) = find(p as u64, len as u64) else {
+            unregister(p, p as u64);
+            return;
+        };
+        copy.update(p, len);
+        copy.writing(p, PAGE, false);
+        let ptr = {
+            let mut before = copy.before.lock().unwrap();
+            before.0[0].1.reserve(PAGE);
+            before.0[0].1.as_ptr()
+        };
+        copy.write_host((p + 10) as u64, &[0xaa]);
+        copy.writing(p + PAGE / 2, PAGE, false);
+        assert_eq!(copy.before.lock().unwrap().0[0].1.as_ptr(), ptr, "extended in place");
+        copy.write_host((p + PAGE + 10) as u64, &[0xbb]);
+        // SAFETY: a byte of our pool.
+        unsafe { ((p + 20) as *mut u8).write_volatile(0xcc) };
+        copy.copy_back(p, PAGE);
+        copy.copy_back(p + PAGE / 2, PAGE);
+        // SAFETY: bytes of our pool.
+        let read = |at: usize| unsafe { ((p + at) as *const u8).read_volatile() };
+        assert_eq!((read(10), read(20), read(PAGE + 10)), (0xaa, 0xcc, 0xbb));
+        unregister(p, p as u64);
+    }
+
+    #[test]
+    fn growing_snapshot_preserves_gpu_and_later_title_writes() {
+        let p = crate::watch::tests::pool(2);
+        let len = 2 * PAGE;
+        register(p, p as u64, len as u64);
+        let Some(copy) = find(p as u64, len as u64) else {
+            unregister(p, p as u64);
+            return;
+        };
+        copy.update(p, len);
+        copy.writing(p, PAGE, false);
+        {
+            let mut before = copy.before.lock().unwrap();
+            let bytes = &mut before.0[0].1;
+            *bytes = bytes.clone().into_boxed_slice().into_vec();
+            assert_eq!(bytes.capacity(), PAGE);
+        }
+        copy.write_host((p + 10) as u64, &[0xaa]);
+        copy.writing(p + PAGE / 2, PAGE, false);
+        assert!(copy.before.lock().unwrap().0[0].1.capacity() >= 2 * PAGE);
+        copy.writing(p + PAGE, PAGE, false);
+        copy.write_host((p + PAGE + 10) as u64, &[0xbb]);
+        // SAFETY: a byte in our pool.
+        unsafe { ((p + 20) as *mut u8).write_volatile(0xcc) };
+        copy.copy_back(p, PAGE);
+        copy.copy_back(p + PAGE / 2, PAGE);
+        copy.copy_back(p + PAGE, PAGE);
+        // SAFETY: bytes in our pool.
+        let read = |at: usize| unsafe { ((p + at) as *const u8).read_volatile() };
+        assert_eq!((read(10), read(20), read(PAGE + 10)), (0xaa, 0xcc, 0xbb));
+        assert!(copy.before.lock().unwrap().0.is_empty());
         unregister(p, p as u64);
     }
 

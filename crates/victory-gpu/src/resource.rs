@@ -63,6 +63,76 @@ const RESOURCE_IIDS: [Iid; 4] = [
 const KIB_64: u64 = 64 << 10;
 const MIB_4: u64 = 4 << 20;
 
+/// Title address range selected for texture alias diagnostics, parsed once per run.
+#[cfg(feature = "diagnostics")]
+fn trace_texture_range() -> Option<(u64, u64)> {
+    static RANGE: std::sync::LazyLock<Option<(u64, u64)>> = std::sync::LazyLock::new(|| {
+        let value = std::env::var("VICTORY_TRACE_TEXTURE_MEMORY").ok()?;
+        let (address, len) = value.trim().split_once(':').unwrap_or((value.trim(), "1"));
+        let hex = |s: &str| u64::from_str_radix(s.trim().trim_start_matches("0x").trim_start_matches("0X"), 16).ok();
+        let (address, len) = (hex(address)?, hex(len)?);
+        (len > 0).then_some((address, len))
+    });
+    *RANGE
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn trace_texture_memory() -> Option<u64> {
+    trace_texture_range().map(|range| range.0)
+}
+
+#[cfg(feature = "diagnostics")]
+fn ranges_overlap(a: u64, a_len: u64, b: u64, b_len: u64) -> bool {
+    a_len != 0 && b_len != 0 && if a <= b { b - a < a_len } else { a - b < b_len }
+}
+
+/// Whether this half-open byte range overlaps the selected title range.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn trace_texture_overlap(start: u64, len: u64) -> bool {
+    trace_texture_range().is_some_and(|(address, size)| ranges_overlap(start, len, address, size))
+}
+
+/// Reports constructed and dropped resources without retaining them or taking resource locks.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn trace_resource(resource: &Resource, event: &'static str) {
+    let Some((address, selected_len)) = trace_texture_range() else { return };
+    let start = resource.data() as u64;
+    // Texture::size covers data planes, not the console's compression metadata.
+    let size = if resource.desc.dimension == BUFFER {
+        Some(resource.desc.width)
+    } else {
+        texture_layout(&resource.desc).map(|layout| layout.size)
+    };
+    if !size.is_some_and(|len| ranges_overlap(start, len, address, selected_len))
+        && !(start == address && size.is_none())
+    {
+        return;
+    }
+    let coverage = if size.is_none() {
+        "unknown texture layout; same start only"
+    } else if resource.desc.dimension == BUFFER {
+        "buffer bytes"
+    } else {
+        "texture data planes only; compression metadata excluded"
+    };
+    static EVENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = EVENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n < 2048 {
+        tracing::info!(
+            event,
+            resource = format_args!("{:#x}", std::ptr::from_ref(resource) as usize),
+            selected = format_args!("{address:#x}"),
+            start = format_args!("{start:#x}"),
+            range_bytes = ?size,
+            coverage,
+            desc = ?resource.desc,
+            "texture memory resource candidate"
+        );
+    } else if n == 2048 {
+        tracing::info!("texture memory resource candidate log limit reached");
+    }
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct HeapProperties {
@@ -1771,6 +1841,8 @@ fn hand_out_resource(
         // SAFETY: the title passes a whole clear value (or null).
         made_with: (state, (!clear.is_null()).then(|| unsafe { clear.cast::<[u32; 5]>().read_unaligned() })),
     });
+    #[cfg(all(windows, feature = "diagnostics"))]
+    trace_resource(&resource, "constructed");
     #[cfg(windows)]
     if desc.dimension == BUFFER {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
@@ -1827,6 +1899,8 @@ pub(crate) fn alias_source(placed: This) -> Option<This> {
 #[cfg(windows)]
 impl Drop for Resource {
     fn drop(&mut self) {
+        #[cfg(feature = "diagnostics")]
+        trace_resource(self, "dropped");
         #[cfg(feature = "diagnostics")]
         if made(self).is_some_and(|h| std::sync::Arc::strong_count(&h) > 2)
         {
@@ -2300,6 +2374,18 @@ pub(crate) fn test_buffer(width: u64) -> This {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn traced_ranges_overlap_without_overflow() {
+        assert!(!ranges_overlap(10, 0, 10, 1));
+        assert!(!ranges_overlap(10, 5, 9, 1));
+        assert!(ranges_overlap(10, 5, 9, 2));
+        assert!(ranges_overlap(10, 5, 14, 1));
+        assert!(!ranges_overlap(10, 5, 15, 1));
+        assert!(ranges_overlap(u64::MAX - 2, 4, u64::MAX, 1));
+        assert!(!ranges_overlap(u64::MAX - 2, 4, 0, 1));
+    }
 
     #[test]
     fn a_regions_rows_in_a_footprint() {

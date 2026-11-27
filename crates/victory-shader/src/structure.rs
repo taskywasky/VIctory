@@ -472,6 +472,11 @@ pub struct Structured {
     /// A pixel's discards, by block and instruction: the lanes (EXEC there)
     /// the instruction takes out of the live mask, which here stay in it.
     pub discards: HashMap<(usize, usize), Bool>,
+    /// Byte offsets of `s_cbranch_scc*`, `vcc*` and `exec*` kept on the
+    /// wave-wide test ([`structure_with`]), and the SCC, VCC or EXEC (low
+    /// dword) values they read.
+    pub waves: HashSet<usize>,
+    pub wave_scc: HashSet<Value>,
 }
 
 impl Structured {
@@ -486,7 +491,15 @@ impl Structured {
 
 /// Builds the per-lane form of `program`.
 pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
-    structure_as(program, true)
+    structure_as(program, true, &HashSet::new())
+}
+
+/// [`structure`] with the `s_cbranch_scc*` at byte offsets `waves` taken
+/// on the wave's SCC (any lane of a mask operation) instead of the lane's
+/// own bit: a loop latched there runs while any lane of the wave still
+/// loops, lanes that left it guarded off, as the console runs it.
+pub fn structure_with(program: &Program, waves: &HashSet<usize>) -> Result<Structured, ShaderError> {
+    structure_as(program, true, waves)
 }
 
 /// The per-lane form with a pixel's discarded lanes taken out of the live
@@ -494,11 +507,12 @@ pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
 /// what a program needs whose discarded lanes would read values no
 /// surviving lane does (see [`Structured::discards`]).
 pub fn killing(program: &Program) -> Result<Structured, ShaderError> {
-    structure_as(program, false)
+    structure_as(program, false, &HashSet::new())
 }
 
-fn structure_as(program: &Program, helpers: bool) -> Result<Structured, ShaderError> {
+fn structure_as(program: &Program, helpers: bool, waves: &HashSet<usize>) -> Result<Structured, ShaderError> {
     let mut l = Lanes::new(program)?;
+    l.waves = waves.clone();
     if !helpers {
         l.kills.clear();
     }
@@ -552,6 +566,8 @@ struct Lanes<'a> {
     /// A pixel's discards (see [`Structured::discards`]) by block and
     /// instruction.
     kills: HashSet<(usize, usize)>,
+    /// See [`Structured::waves`].
+    waves: HashSet<usize>,
 }
 
 /// A mask join taken as `value` in every lane that reaches `block`: each
@@ -617,6 +633,7 @@ impl<'a> Lanes<'a> {
             active: HashSet::new(),
             restored: Map::default(),
             kills: HashSet::new(),
+            waves: HashSet::new(),
         };
         for block in blocks {
             if let Exit::Branch { taken, not_taken } = block.exit
@@ -891,6 +908,22 @@ impl<'a> Lanes<'a> {
             exits,
             guards,
             reach: cond.to_vec(),
+            wave_scc: blocks
+                .iter()
+                .filter_map(|b| b.insts.last())
+                .filter(|i| self.waves.contains(&i.machine.offset))
+                .filter_map(|i| {
+                    let n = i.name();
+                    i.read(if n.starts_with("s_cbranch_vcc") {
+                        Reg::S(VCC)
+                    } else if n.starts_with("s_cbranch_exec") {
+                        Reg::S(EXEC)
+                    } else {
+                        Reg::Scc
+                    })
+                })
+                .collect(),
+            waves: self.waves,
         })
     }
 
@@ -1327,8 +1360,26 @@ impl<'a> Lanes<'a> {
     fn branch(&mut self, inst: &Inst) -> Bool {
         let exec = self.exec(inst);
         match inst.name() {
+            n @ ("s_cbranch_execz" | "s_cbranch_execnz")
+                if self.waves.contains(&inst.machine.offset)
+                    && let Some(lo) = inst.read(Reg::S(EXEC)) =>
+            {
+                // The wave's test: some lane is in EXEC.
+                let born = self.born(lo);
+                let any = self.b.atom(Atom::Uniform(lo), born);
+                if n.ends_with("nz") { any } else { self.b.not(any) }
+            }
             "s_cbranch_execz" => self.b.not(exec),
             "s_cbranch_execnz" => exec,
+            n @ ("s_cbranch_vccz" | "s_cbranch_vccnz")
+                if self.waves.contains(&inst.machine.offset)
+                    && let Some(lo) = inst.read(Reg::S(VCC)) =>
+            {
+                // The wave's test: VCC is not zero in any lane.
+                let born = self.born(lo);
+                let any = self.b.atom(Atom::Uniform(lo), born);
+                if n.ends_with("nz") { any } else { self.b.not(any) }
+            }
             n @ ("s_cbranch_vccz" | "s_cbranch_vccnz") => {
                 let vcc = match self.key(|r| inst.read(r), VCC) {
                     Some(k) => self.mask(k).0,
@@ -1345,7 +1396,8 @@ impl<'a> Lanes<'a> {
                 let Some(scc) = inst.read(Reg::Scc) else {
                     return Bool::FALSE;
                 };
-                let set = match self.scc_lane.get(&scc) {
+                let wave = self.waves.contains(&inst.machine.offset);
+                let set = match self.scc_lane.get(&scc).filter(|_| !wave) {
                     Some(&m) => m,
                     None => {
                         let born = self.born(scc);

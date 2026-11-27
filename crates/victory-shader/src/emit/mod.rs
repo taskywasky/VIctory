@@ -189,6 +189,12 @@
 //!   [`VIEW_READS`] + the view's heap index in the same bitmap, after the
 //!   written pages, where still clear: the host makes views it left null
 //!   until a shader reads them (textures the title placed itself).
+//! * **Texture write marks**: with shader diagnostics enabled and nonempty
+//!   `VICTORY_TRACE_TEXTURE_MEMORY`, image stores and atomics through heap
+//!   or table descriptors set [`VIEW_TEXTURE_WRITES`] + the clamped host
+//!   heap index, in the lanes actually executing the instruction. These
+//!   transient marks are separate from persistent read marks. A mark
+//!   identifies a slot, not its descriptor or command provenance.
 //!
 //! Entry points: [`translate`] (container bytes as the title passes them
 //! at pipeline creation → [`HostShader`]), [`emit`] (the same with the
@@ -252,12 +258,26 @@ pub use sampler::StaticSampler;
 pub use shader::{
     HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE,
     VIEW_BLOCK_SHIFT, VIEW_BLOCKS, VIEW_INTEGER, VIEW_MARK_NONE, VIEW_MARKS, VIEW_READS,
-    VIEW_RAW_SRV, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES, VIEW_WRITE_BITS, VIEW_WRITES, heap_views,
-    null_buffer_view, set_view_heap, view_blocks,
+    VIEW_RAW_SRV, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES, VIEW_TEXTURE_WRITES, VIEW_WRITE_BITS,
+    VIEW_WRITES, heap_views, null_buffer_view, set_view_heap, view_blocks,
 };
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
+
+/// Whether translations trace heap-direct texture stores and atomics.
+/// The shader cache must include this setting in its key.
+pub fn trace_texture_writes() -> bool {
+    if cfg!(feature = "diagnostics") {
+        texture_writes_enabled(true, std::env::var_os("VICTORY_TRACE_TEXTURE_MEMORY").as_deref())
+    } else {
+        false
+    }
+}
+fn texture_writes_enabled(diagnostics: bool, value: Option<&std::ffi::OsStr>) -> bool {
+    diagnostics && value.is_some_and(|value| !value.is_empty())
+}
+
 
 /// The iteration count after which a translated loop is left, per lane and
 /// per entry into the loop: [`DEFAULT_LOOP_LIMIT`].
@@ -367,10 +387,9 @@ pub struct HostShader {
     /// Whether some of those are unordered access views: it may write
     /// through any of the heap's.
     pub heap_writes: bool,
-    /// Whether it marks the pages it writes through buffer views: the host
-    /// binds the view-mark table `t`[`VIEW_MARKS`] and the bitmap
-    /// `u`[`VIEW_WRITES`] in [`MEMORY_SPACE`] (module notes, "Write
-    /// marks").
+    /// Whether it uses the view bitmap for buffer writes, texture reads or
+    /// texture writes: the host binds the view-mark table `t`[`VIEW_MARKS`]
+    /// and bitmap `u`[`VIEW_WRITES`] in [`MEMORY_SPACE`] (module notes).
     pub view_marks: bool,
 }
 
@@ -471,7 +490,81 @@ pub fn emit(
 }
 
 /// [`emit`] made as `options` say.
+///
+/// Split waves: an `s_cbranch_execz` only skips code that EXEC already
+/// masks, so a program runs the same with it as `s_nop`. When lane
+/// branches leave LDS accesses unfenced, the innermost such skip around
+/// the access falls through instead: its arm becomes guarded code the
+/// whole group runs together, where accesses can be fenced. With no skip
+/// left, a lane loop around it in a one-wave group is latched on the
+/// wave's SCC ([`structure::structure_with`]): every lane runs every
+/// iteration, those done guarded off, as the console runs them.
 pub fn emit_with(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    options: Options,
+) -> Result<HostShader, ShaderError> {
+    split::REFUSED.take();
+    let first = emit_once(c, native, p, st, io, res, options);
+    let mut code = native.patched_code();
+    let mut waves = std::collections::HashSet::new();
+    // Wave-level latches are exact only where the group is one console wave.
+    let one_wave = native.wave64
+        && matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() <= 64);
+    let mut current: Option<ir::Program> = None;
+    let mut result = Err(ShaderError::Malformed("unreached"));
+    for _ in 0..24 {
+        let last = if current.is_some() { &result } else { &first };
+        let Err(ShaderError::Unsupported { offset, what: split::UNFENCED_LDS }) = *last else { break };
+        let q = current.as_ref().unwrap_or(p);
+        // The refused region's branches: an EXEC skip falls through, and in
+        // a one-wave group a branch on a wave-wide test is taken by the whole
+        // wave (exact there, as the console runs it).
+        let mut changed = false;
+        for at in split::REFUSED.take() {
+            let Some(name) = q.blocks.iter().filter_map(|b| b.insts.last()).find(|i| i.machine.offset == at).map(|i| i.name()) else {
+                continue;
+            };
+            if name == "s_cbranch_execz" && split::skips_forward(q, at) {
+                code[at..at + 4].copy_from_slice(&0xBF80_0000u32.to_le_bytes()); // s_nop 0
+                changed = true;
+            } else if one_wave
+                && ["s_cbranch_scc", "s_cbranch_vcc", "s_cbranch_exec"].iter().any(|k| name.starts_with(k))
+                && waves.insert(at)
+            {
+                changed = true;
+            }
+        }
+        if changed {
+        } else if let Some(at) = split::execz_skip_over(q, offset) {
+            code[at..at + 4].copy_from_slice(&0xBF80_0000u32.to_le_bytes()); // s_nop 0
+        } else if let exits = split::loop_exits_over(q, offset, &waves)
+            && one_wave
+            && !exits.is_empty()
+        {
+            waves.extend(exits);
+        } else {
+            break;
+        }
+        let built = crate::range::build_with(&code, native.wave64, native.vgprs, &waves);
+        let Ok((q, Ok(s))) = built else { break };
+        let (Ok(r), Ok(i)) = (resource::track(&q, &native.layout, native.stage, Some(&s)), io::raise(&q, native)) else {
+            break;
+        };
+        result = emit_once(c, native, &q, &s, &i, &r, options);
+        current = Some(q);
+        if result.is_ok() {
+            return result;
+        }
+    }
+    first
+}
+
+fn emit_once(
     c: &Container,
     native: &NativeProgram,
     p: &ir::Program,
@@ -684,6 +777,15 @@ mod tests {
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
+
+    #[test]
+    fn texture_write_switch_requires_diagnostics_and_a_nonempty_value() {
+        use std::ffi::OsStr;
+        assert!(!texture_writes_enabled(false, Some(OsStr::new("1"))));
+        assert!(!texture_writes_enabled(true, None));
+        assert!(!texture_writes_enabled(true, Some(OsStr::new(""))));
+        assert!(texture_writes_enabled(true, Some(OsStr::new("0"))));
+    }
 
     #[test]
     fn the_loop_limit_switch_parses_or_falls_back() {

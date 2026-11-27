@@ -1484,7 +1484,7 @@ impl<'a> Lower<'a> {
                     }
                 }
             }
-            split.convergent = super::split::convergent(self.x.st, |from, to| {
+            split.convergent = super::split::convergent(p, self.x.st, |from, to| {
                 self.counters.contains_key(&to) && self.rpo[to] <= self.rpo[from]
                     && !self.guarded_latches.contains_key(&from)
             });
@@ -1492,11 +1492,26 @@ impl<'a> Lower<'a> {
                 && let Some(offset) = super::split::unfenced_lds(
                     p, &order, &split.convergent, lds_access, lds_write,
                     |root, block, first, second| {
-                        super::split::independent_stores(p, self.x.st, root, block, first, second, split.base * 4)
+                        super::split::independent_lds(
+                            p, self.x.st, root, block, first, second, split.base * 4,
+                            matches!(self.x.native.io, StageIo::Cs(cs) if cs.threads == [64, 1, 1]),
+                        )
+                    },
+                    |root, block| {
+                        super::split::singleton_lds(
+                            p, self.x.st, &split.convergent, root, block,
+                            matches!(self.x.native.io, StageIo::Cs(cs) if cs.threads == [64, 1, 1]),
+                        )
+                    },
+                    |root| {
+                        super::split::thread_zero(
+                            p, self.x.st, &split.convergent, root,
+                            matches!(self.x.native.io, StageIo::Cs(cs) if cs.threads[1] == 1 && cs.threads[2] == 1),
+                        )
                     },
                 )
             {
-                return Err(unsupported(offset, "LDS accesses without a uniform LDS fence in split wave64"));
+                return Err(unsupported(offset, super::split::UNFENCED_LDS));
             }
         }
         self.cur = self.s.entry;
@@ -2662,6 +2677,11 @@ impl<'a> Lower<'a> {
                     .copied()
                     .unwrap_or("a lane mask from a carry")
             }),
+            // A wave-level branch on a mask (VCC, EXEC): both dwords' lanes.
+            Atom::Uniform(v) if at == self.cur && self.x.st.wave_scc.contains(&v) && self.x.st.masks.contains_key(&v) => {
+                self.wave_any(v)
+            }
+            Atom::Uniform(v) if at == self.cur && matches!(self.get(v), Err(LANE_MASK)) => self.scc_value(v),
             Atom::Uniform(v) => match self.get(v)? {
                 Val::Bit(x) => Ok(x),
                 Val::I32(x) => {
@@ -4462,8 +4482,61 @@ impl<'a> Lower<'a> {
 
     fn scc_in(&mut self, inst: &Inst) -> Result<V, Why> {
         let v = inst.read(Reg::Scc).ok_or("an unread SCC")?;
-        match self.get(v)? {
-            Val::Bit(x) => Ok(x),
+        self.scc_value(v)
+    }
+
+    /// Whether wave mask `lo` (its low dword's value; VCC, EXEC) has a lane
+    /// set in either dword: a wave-level `s_cbranch_vcc*` or `exec*`. Not
+    /// cached in `vals`, where the mask stays a mask for its other readers.
+    fn wave_any(&mut self, lo: Value) -> Result<V, Why> {
+        if self.split.is_some() && !self.convergent_at(self.cur_ir, self.cur) {
+            return Err(LANE_MASK);
+        }
+        let hi = self.x.st.highs.iter().find(|&(_, &l)| l == lo).map(|(&hi, _)| hi).ok_or(LANE_MASK)?;
+        let low = self.mask_dword(lo)?;
+        let high = self.mask_dword(hi)?;
+        let bits = self.s.m.bin(self.cur, Bin::Or, low, high);
+        let zero = self.s.m.i32(0);
+        Ok(self.s.m.cmp(self.cur, pred::NE, bits, zero))
+    }
+
+    /// SCC value `v`; a mask operation's from its ballot where it can be.
+    fn scc_value(&mut self, v: Value) -> Result<V, Why> {
+        match self.get(v) {
+            Ok(Val::Bit(x)) => Ok(x),
+            Err(LANE_MASK) if self.split.is_some() && self.convergent_at(self.cur_ir, self.cur) => {
+                // Only materialize an AND's SCC in its own convergent block:
+                // its active mask has no set bits in lanes outside that block.
+                let block = &self.x.p.blocks[self.cur_ir];
+                let def = block.insts.iter().find(|i| i.write(Reg::Scc) == Some(v)).ok_or(LANE_MASK)?;
+                let Fields::Sop { dst: Some(Operand::Scalar { code, .. }), .. } = &def.fields else {
+                    return Err(LANE_MASK);
+                };
+                // A wave-level branch's SCC: any bitwise result, every lane
+                // of the group being here to ballot its bit.
+                let wave = self.x.st.wave_scc.contains(&v)
+                    && matches!(
+                        def.name(),
+                        "s_and_b64" | "s_andn2_b64" | "s_or_b64" | "s_orn2_b64" | "s_xor_b64"
+                            | "s_nand_b64" | "s_nor_b64" | "s_xnor_b64"
+                    );
+                if def.name() != "s_and_b64" && !wave {
+                    return Err(LANE_MASK);
+                }
+                let lo = def.write(Reg::S(*code)).ok_or(LANE_MASK)?;
+                let hi = def.write(Reg::S(code.checked_add(1).ok_or(LANE_MASK)?)).ok_or(LANE_MASK)?;
+                if !(wave || self.x.st.active.contains(&lo)) || self.x.st.highs.get(&hi) != Some(&lo) {
+                    return Err(LANE_MASK);
+                }
+                let low = self.mask_dword(lo)?;
+                let high = self.mask_dword(hi)?;
+                let bits = self.s.m.bin(self.cur, Bin::Or, low, high);
+                let zero = self.s.m.i32(0);
+                let result = self.s.m.cmp(self.cur, pred::NE, bits, zero);
+                self.vals.insert(v, Val::Bit(result));
+                Ok(result)
+            }
+            Err(why) => Err(why),
             _ => Err("SCC without a value"),
         }
     }
@@ -5668,7 +5741,8 @@ impl<'a> Lower<'a> {
     /// none: the host makes the slot for the draw.
     fn handle(&mut self, site: Site, src: &Source, sampler: bool, props: (u32, u32)) -> Result<V, Why> {
         let h = self.handle_made(site, src, sampler, props)?;
-        if let Some(&index) = self.s.texture_index.get(&h)
+        if props.0 & 0x1000 == 0
+            && let Some(&index) = self.s.texture_index.get(&h)
             && self.is_heap_direct(src)
         {
             self.s.texture_reads.push(index);
@@ -7325,7 +7399,9 @@ impl<'a> Lower<'a> {
         }
         let float_result = |l: &mut Self, mut f: V| -> Result<(), Why> {
             if v.omod != 0 {
-                return Err("an output modifier on a 16-bit operation");
+                let factor = [1.0f32, 2.0, 4.0, 0.5][usize::from(v.omod)];
+                let k = l.s.m.f32(factor.to_bits());
+                f = l.s.m.bin(c, Bin::Mul, f, k);
             }
             if v.clamp {
                 f = l.unary(7, f);
@@ -8676,11 +8752,24 @@ impl<'a> Lower<'a> {
         if !self.x.view_marks {
             return;
         }
+        self.mark_texture_bit(index, super::VIEW_READS);
+    }
+
+    /// Mark an executed texture write independently of read marks.
+    fn mark_texture_write(&mut self, h: V) {
+        if super::shader::texture_write_marks()
+            && let Some(&index) = self.s.texture_index.get(&h)
+        {
+            self.mark_texture_bit(index, super::VIEW_TEXTURE_WRITES);
+        }
+    }
+
+    fn mark_texture_bit(&mut self, index: V, base: u32) {
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
         let bitmap = self.s.view_writes_handle();
         let c = self.cur;
         let (base, k5, k2, k31, one, zero) =
-            (k(self, super::VIEW_READS), k(self, 5), k(self, 2), k(self, 31), k(self, 1), k(self, 0));
+            (k(self, base), k(self, 5), k(self, 2), k(self, 31), k(self, 1), k(self, 0));
         let n = self.s.m.bin(c, Bin::Add, index, base);
         let word = self.s.m.bin(c, Bin::LShr, n, k5);
         let word = self.s.m.bin(c, Bin::Shl, word, k2);
@@ -8894,6 +8983,7 @@ impl<'a> Lower<'a> {
                     &args,
                 )
             };
+            self.mark_texture_write(h);
             let r = if wide {
                 let (lo, hi) = self.split64(r);
                 vec![lo, hi]
@@ -8959,6 +9049,7 @@ impl<'a> Lower<'a> {
                 67,
                 &args,
             );
+            self.mark_texture_write(h);
             self.end_guarded(at, &[]);
             return Ok(());
         }

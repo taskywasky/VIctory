@@ -38,8 +38,18 @@ pub fn build(
     wave64: bool,
     vgprs: u16,
 ) -> Result<(Program, Result<Structured, ShaderError>), ShaderError> {
+    build_with(code, wave64, vgprs, &std::collections::HashSet::new())
+}
+
+/// [`build`] with [`structure::structure_with`]'s wave-level branches.
+pub fn build_with(
+    code: &[u8],
+    wave64: bool,
+    vgprs: u16,
+    waves: &std::collections::HashSet<usize>,
+) -> Result<(Program, Result<Structured, ShaderError>), ShaderError> {
     let p = ir::build(code, wave64, vgprs)?;
-    let st = structure::structure(&p);
+    let st = structure::structure_with(&p, waves);
     let mut assumed: HashMap<usize, u8> = p
         .blocks
         .iter()
@@ -56,7 +66,7 @@ pub fn build(
             break;
         }
         let q = ir::build_bounded(code, wave64, vgprs, &assumed)?;
-        let Ok(s) = structure::structure(&q) else {
+        let Ok(s) = structure::structure_with(&q, waves) else {
             break;
         };
         let found = relative_bounds(&q, &s);
@@ -69,7 +79,7 @@ pub fn build(
                 return Ok((q, Ok(s)));
             }
             let q = ir::build_bounded(code, wave64, vgprs, &proven)?;
-            let s = structure::structure(&q);
+            let s = structure::structure_with(&q, waves);
             return Ok((q, s));
         }
         assumed = assumed

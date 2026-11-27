@@ -18,10 +18,19 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 /// Per block: whether every thread of the group that starts the program
 /// reaches it, together and as often as the others.
 ///
-/// A scalar branch can differ between host halves after a half-local read.
+/// A scalar branch can differ between host halves after a half-local read;
+/// one on SCC that only same-in-both-halves scalars decide ([`half_local`])
+/// sends the whole group one way and splits nothing.
 /// Model watchdog returns as exits too: threads that return cannot reach
 /// a later barrier, even if that block post-dominated the original loop.
+/// A watchdog latch the whole group reaches together counts the same
+/// iterations in every thread, so all return together.
+///
+/// Optimistic fixpoint: start with only lane branches splitting, then add
+/// scalar branches and latches whose justification fails until none do.
+/// Halves start with the same scalars, so they stay equal until a split.
 pub(crate) fn convergent(
+    p: &Program,
     st: &Structured,
     watchdog_return: impl Fn(usize, usize) -> bool,
 ) -> Vec<bool> {
@@ -40,14 +49,169 @@ pub(crate) fn convergent(
         })
         .collect();
     succs.push(Vec::new());
-    let mut out = reconverged(&succs);
-    out.pop();
-    out
+    let scalar = |b: usize| match st.exits[b] {
+        LaneExit::Branch { when, .. } => {
+            let atoms = st.bools.support(when);
+            (!atoms.is_empty() && atoms.iter().all(|a| matches!(a, Atom::Uniform(_)))).then_some(atoms)
+        }
+        _ => None,
+    };
+    let mut splits: Vec<bool> = (0..=exit).map(|b| b < exit && succs[b].len() > 1 && scalar(b).is_none()
+        && !matches!(st.exits[b], LaneExit::Jump(_))).collect();
+    loop {
+        let out = reconverged(&succs, &splits);
+        let dirty = half_local(p, &out, &st.wave_scc);
+        let next: Vec<bool> = (0..=exit)
+            .map(|b| {
+                b < exit && succs[b].len() > 1 && match st.exits[b] {
+                    LaneExit::Jump(_) => !out[b],
+                    _ => scalar(b).is_none_or(|atoms| {
+                        atoms.iter().any(|a| matches!(a, Atom::Uniform(v) if dirty.contains(v)))
+                    }),
+                }
+            })
+            .collect();
+        if next == splits {
+            let mut out = out;
+            out.pop();
+            return out;
+        }
+        splits = next;
+    }
+}
+
+/// Values that may differ between the two host halves, given which blocks
+/// the whole group runs together (`together`): lane data, masks, anything
+/// a vector instruction writes, scalar work outside `together` (a half
+/// with no active lanes skips it), and whatever they reach. Phis join
+/// equal values only where every predecessor ran together too.
+/// A wave-level branch's SCC (`waves`) is a ballot over both halves where
+/// the group runs together, the same in each.
+fn half_local(
+    p: &Program,
+    together: &[bool],
+    waves: &std::collections::HashSet<Value>,
+) -> std::collections::HashSet<Value> {
+    use crate::ir::{EXEC, VCC};
+    let masks = |r: Reg| matches!(r, Reg::V(_) | Reg::Scc) || matches!(r, Reg::S(c) if c & !1 == EXEC || c & !1 == VCC);
+    let mut dirty: std::collections::HashSet<Value> =
+        p.inputs.iter().filter(|(r, _)| masks(*r)).map(|&(_, v)| v).collect();
+    loop {
+        let before = dirty.len();
+        for (b, block) in p.blocks.iter().enumerate() {
+            let joined = together[b] && block.preds.iter().all(|&q| together[q]);
+            for phi in &block.phis {
+                if !joined || phi.args.iter().any(|a| dirty.contains(a)) {
+                    dirty.insert(phi.value);
+                }
+            }
+            for i in &block.insts {
+                // Clocks, hardware ids and atomics answer each host wave differently.
+                let n = i.name();
+                let scalar = matches!(i.fields, Fields::Sop { .. } | Fields::Smem { .. })
+                    && !["s_memtime", "s_memrealtime", "s_getreg", "s_sendmsg", "s_atomic", "s_buffer_atomic"]
+                        .iter().any(|x| n.starts_with(x));
+                if !scalar || !together[b] || i.reads.iter().any(|&(r, v)| masks(r) && r != Reg::Scc || dirty.contains(&v)) {
+                    let ballot = |v: &Value| together[b] && waves.contains(v);
+                    dirty.extend(i.writes.iter().map(|&(_, v)| v).filter(|v| !ballot(v)));
+                }
+            }
+        }
+        if dirty.len() == before {
+            return dirty;
+        }
+    }
+}
+
+/// [`unfenced_lds`]'s refusal.
+pub(crate) const UNFENCED_LDS: &str = "LDS accesses without a uniform LDS fence in split wave64";
+
+/// Whether the branch at byte `at` is a plain forward skip: its target is
+/// after it and nothing it skips jumps back to at or before it (a loop's
+/// exit is not: falling through it would loop on with no lane left).
+pub(crate) fn skips_forward(p: &Program, at: usize) -> bool {
+    let Some((b, taken)) = p.blocks.iter().find_map(|b| {
+        let crate::ir::Exit::Branch { taken, .. } = b.exit else { return None };
+        b.insts.last().filter(|i| i.machine.offset == at).map(|_| (b, taken))
+    }) else {
+        return false;
+    };
+    let target = p.blocks[taken].offset;
+    target > b.offset
+        && !p.blocks.iter().filter(|q| (at..target).contains(&q.offset)).any(|q| {
+            q.exit.successors().iter().any(|&t| p.blocks[t].offset <= at)
+        })
+}
+
+/// The byte offset of the innermost forward `s_cbranch_execz` whose skip
+/// spans byte `offset` ([`skips_forward`]).
+pub(crate) fn execz_skip_over(p: &Program, offset: usize) -> Option<usize> {
+    p.blocks
+        .iter()
+        .filter_map(|b| {
+            let crate::ir::Exit::Branch { taken, .. } = b.exit else { return None };
+            let last = b.insts.last().filter(|i| i.name() == "s_cbranch_execz")?;
+            let at = last.machine.offset;
+            (at < offset && offset < p.blocks[taken].offset && skips_forward(p, at)).then_some(at)
+        })
+        .max()
+}
+
+/// The `s_cbranch_scc*`, `vcc*` and `exec*` (byte offsets, not in
+/// `taken`) that close or leave the innermost loop around byte `offset` that has any: a loop is a
+/// back edge to at or before `offset` from a block ending at or after it.
+pub(crate) fn loop_exits_over(
+    p: &Program,
+    offset: usize,
+    taken: &std::collections::HashSet<usize>,
+) -> Vec<usize> {
+    let end = |b: &crate::ir::Block| b.insts.last().map_or(b.offset, |i| i.machine.offset);
+    let mut loops: Vec<(usize, usize)> = p
+        .blocks
+        .iter()
+        .flat_map(|b| {
+            let at = end(b);
+            b.exit.successors().into_iter().map(move |t| (p.blocks[t].offset, at))
+        })
+        .filter(|&(head, at)| head <= offset && offset <= at && head <= at)
+        .collect();
+    loops.sort_by_key(|&(head, at)| at - head);
+    for (head, at) in loops {
+        let exits: Vec<usize> = p
+            .blocks
+            .iter()
+            .filter(|b| (head..=at).contains(&b.offset))
+            .filter_map(|b| {
+                let last = b.insts.last().filter(|i| {
+                    ["s_cbranch_scc", "s_cbranch_vcc", "s_cbranch_exec"].iter().any(|k| i.name().starts_with(k))
+                })?;
+                let o = last.machine.offset;
+                let leaves = b.exit.successors().iter().any(|&t| {
+                    let t = p.blocks[t].offset;
+                    t < head || t > at || o == at
+                });
+                (leaves && !taken.contains(&o)).then_some(o)
+            })
+            .collect();
+        if !exits.is_empty() {
+            return exits;
+        }
+    }
+    Vec::new()
+}
+
+thread_local! {
+    /// The byte offsets of the last instructions of the region [`unfenced_lds`]
+    /// last refused on this thread, its root's first, for the retry in
+    /// `emit_with`.
+    // shortcut: a side channel past `ShaderError`, which carries one offset;
+    // give the error a field if a second caller needs it.
+    pub(crate) static REFUSED: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// The two halves may run different arms of a region at the same time.
 /// Another access after a write needs a barrier unless the compiler can
-/// prove that two stores touch different host dwords.
+/// prove that the accesses touch different host dwords.
 pub(super) fn unfenced_lds(
     p: &Program,
     order: &[usize],
@@ -55,15 +219,18 @@ pub(super) fn unfenced_lds(
     access: impl Fn(&Inst) -> bool,
     write: impl Fn(&Inst) -> bool,
     independent: impl Fn(usize, usize, &Inst, &Inst) -> bool,
+    singleton: impl Fn(usize, usize) -> bool,
+    alone: impl Fn(usize) -> bool,
 ) -> Option<usize> {
     let mut seen = vec![usize::MAX; p.blocks.len()];
     for &root in order {
-        if !uniform[root] {
+        if !uniform[root] || alone(root) {
             continue;
         }
         let mut work = p.blocks[root].exit.successors();
         let mut previous = None;
         let mut multiple = false;
+        let mut multiple_blocks = false;
         let mut written = false;
         while let Some(b) = work.pop() {
             if uniform[b] || seen[b] == root {
@@ -73,12 +240,24 @@ pub(super) fn unfenced_lds(
             for inst in p.blocks[b].insts.iter().filter(|i| access(i)) {
                 let writes = write(inst);
                 if (written || previous.is_some() && writes)
-                    && !(writes && written && !multiple
-                        && previous.is_some_and(|(block, first)| block == b && independent(root, b, first, inst)))
+                    && !(previous.is_some_and(|(block, first)| {
+                        block == b && ((!multiple && independent(root, b, first, inst))
+                            || (!multiple_blocks && singleton(root, b)))
+                    }))
                 {
+                    let mut region = vec![root];
+                    let mut next = p.blocks[root].exit.successors();
+                    while let Some(b) = next.pop() {
+                        if !uniform[b] && !region.contains(&b) {
+                            region.push(b);
+                            next.extend(p.blocks[b].exit.successors());
+                        }
+                    }
+                    REFUSED.set(region.iter().filter_map(|&b| p.blocks[b].insts.last()).map(|i| i.machine.offset).collect());
                     return Some(inst.machine.offset);
                 }
                 written |= writes;
+                multiple_blocks |= previous.is_some_and(|(block, _)| block != b);
                 multiple |= previous.is_some();
                 previous = Some((b, inst));
             }
@@ -88,11 +267,110 @@ pub(super) fn unfenced_lds(
     None
 }
 
-/// Two ordinary stores in the same short lane-prefix arm can use separate
-/// LDS ranges without synchronizing. Include the full dwords used by the
-/// host to implement sub-dword stores.
-pub(super) fn independent_stores(
+/// A region only thread zero enters: `root` branches on `v_cmp(x)_eq_u32
+/// 0, v0` of a one-dimensional group and the other arm is the convergent
+/// join, so no other thread runs until the join's barrier. One thread
+/// cannot race itself, however its accesses are ordered.
+pub(super) fn thread_zero(p: &Program, st: &Structured, uniform: &[bool], root: usize, one_dimensional: bool) -> bool {
+    let proof = || {
+        let LaneExit::Branch { when, taken, not_taken } = st.exits[root] else { return None };
+        let (zero, other) = match st.bools.node(when)? {
+            (Atom::Lane(v), Bool::FALSE, Bool::TRUE) => (v, (taken, not_taken)),
+            (Atom::Lane(v), Bool::TRUE, Bool::FALSE) => (v, (not_taken, taken)),
+            _ => return None,
+        };
+        let (_, join) = other;
+        let cmp = p.blocks[root].insts.iter().find(|i| i.writes.iter().any(|&(_, v)| v == zero))?;
+        let Fields::Valu(v) = &cmp.fields else { return None };
+        let id = p.inputs.iter().find(|(r, _)| *r == Reg::V(0))?.1;
+        let plain = v.neg == 0 && v.abs == 0 && v.opsel == 0 && v.sdwa.is_none() && v.dpp.is_none();
+        let operands = match v.src.as_slice() {
+            [Operand::Const(128), Operand::Vector { reg: 0, dwords: 1 }]
+            | [Operand::Vector { reg: 0, dwords: 1 }, Operand::Const(128)] => true,
+            _ => false,
+        };
+        (one_dimensional && uniform[join] && plain && operands
+            && matches!(cmp.name(), "v_cmpx_eq_u32" | "v_cmp_eq_u32")
+            && cmp.read(Reg::V(0)) == Some(id))
+            .then_some(())
+    };
+    proof().is_some()
+}
+
+/// A derived flag can name thread zero alone: entry initializes it to zero,
+/// only that thread writes -1, and the next branch tests for -1.
+pub(super) fn singleton_lds(
+    p: &Program, st: &Structured, uniform: &[bool], root: usize, block: usize, one_dimensional: bool,
+) -> bool {
+    fn branch(st: &Structured, block: usize) -> Option<(Value, usize, usize)> {
+        let LaneExit::Branch { when, taken, not_taken } = st.exits[block] else { return None };
+        match st.bools.node(when)? {
+            (Atom::Lane(v), Bool::FALSE, Bool::TRUE) => Some((v, taken, not_taken)),
+            (Atom::Lane(v), Bool::TRUE, Bool::FALSE) => Some((v, not_taken, taken)),
+            _ => None,
+        }
+    }
+    fn plain_move(p: &Program, st: &Structured, b: usize, reg: Reg, value: Value, constant: Operand) -> bool {
+        p.blocks[b].insts.iter().zip(&st.guards[b]).any(|(i, guard)| {
+            let Fields::Valu(v) = &i.fields else { return false };
+            guard.is_none() && i.write(reg) == Some(value) && i.name() == "v_mov_b32"
+                && v.src.as_slice() == [constant] && v.neg == 0 && v.abs == 0
+                && v.opsel == 0 && v.sdwa.is_none() && v.dpp.is_none()
+        })
+    }
+    fn eq_input(i: &Inst, mask: Value, left: Operand, right: Operand) -> bool {
+        let Fields::Valu(v) = &i.fields else { return false };
+        i.writes.iter().any(|&(_, value)| value == mask)
+            && matches!(i.name(), "v_cmpx_eq_u32" | "v_cmp_eq_u32")
+            && v.src.as_slice() == [left, right] && v.neg == 0 && v.abs == 0
+            && v.opsel == 0 && v.sdwa.is_none() && v.dpp.is_none()
+    }
+    let proof = || {
+        if !one_dimensional || !uniform[root] || !p.blocks[0].preds.is_empty() { return None; }
+        let (test, yes, join) = branch(st, root)?;
+        if yes != block || !uniform[join] || p.blocks[block].preds != [root]
+            || !matches!(st.exits[block], LaneExit::Jump(t) if t == join)
+        {
+            return None;
+        }
+        let cmp = p.blocks[root].insts.iter().zip(&st.guards[root])
+            .find(|(i, guard)| guard.is_none() && i.writes.iter().any(|&(_, v)| v == test))?.0;
+        let Fields::Valu(v) = &cmp.fields else { return None };
+        let [Operand::Const(193), Operand::Vector { reg, dwords: 1 }] = v.src.as_slice() else { return None };
+        if !eq_input(cmp, test, Operand::Const(193), Operand::Vector { reg: *reg, dwords: 1 }) {
+            return None;
+        }
+        let reg = Reg::V(*reg);
+        let value = cmp.read(reg)?;
+        let phi = p.blocks[root].phis.iter().find(|phi| phi.reg == reg && phi.value == value)?;
+        if p.blocks[root].preds.len() != 2 || phi.args.len() != 2 { return None; }
+        let (entry_test, arm, entry_join) = branch(st, 0)?;
+        if entry_join != root || p.blocks[arm].preds != [0]
+            || !matches!(st.exits[arm], LaneExit::Jump(t) if t == root)
+        {
+            return None;
+        }
+        p.blocks[0].insts.iter().zip(&st.guards[0]).find(|(i, guard)| {
+            guard.is_none()
+                && eq_input(i, entry_test, Operand::Const(128), Operand::Vector { reg: 0, dwords: 1 })
+                && i.read(Reg::V(0)).is_some_and(|v| p.inputs.contains(&(Reg::V(0), v)))
+        })?;
+        for (&pred, &arg) in p.blocks[root].preds.iter().zip(&phi.args) {
+            let (b, constant) = if pred == 0 { (0, Operand::Const(128)) }
+                else if pred == arm { (arm, Operand::Const(193)) }
+                else { return None };
+            if !plain_move(p, st, b, reg, arg, constant) { return None; }
+        }
+        Some(())
+    };
+    proof().is_some()
+}
+
+/// Two accesses in one short lane-branch arm can use separate LDS ranges.
+/// Fixed addresses additionally require at most one active thread in the group.
+pub(super) fn independent_lds(
     p: &Program, st: &Structured, root: usize, block: usize, first: &Inst, second: &Inst, bytes: u32,
+    one_dimensional: bool,
 ) -> bool {
     let proof = || {
         let LaneExit::Branch { when, taken, not_taken } = st.exits[root] else { return None };
@@ -124,6 +402,43 @@ pub(super) fn independent_stores(
             Operand::Literal(v) => Some(v),
             _ => None,
         };
+        let fixed_range = |i: &Inst| {
+            let Fields::Ds { addr: Some(addr), offset0, offset1, gds: false, .. } = i.fields else { return None };
+            let def = plain(block, value(i, addr)?)?;
+            let Fields::Valu(v) = &def.fields else { return None };
+            if def.name() != "v_mov_b32" || v.neg != 0 || v.abs != 0 || v.opsel != 0
+                || v.sdwa.is_some() || v.dpp.is_some() || v.src.as_slice() != [Operand::Const(128)]
+            {
+                return None;
+            }
+            let (start, end) = match i.name() {
+                "ds_read_b32" | "ds_write_b32" => {
+                    let start = u32::from(offset0) | u32::from(offset1) << 8;
+                    (start, start + 4)
+                }
+                "ds_read2_b32" | "ds_write2_b32" => {
+                    (u32::from(offset0.min(offset1)) * 4, (u32::from(offset0.max(offset1)) + 1) * 4)
+                }
+                _ => return None,
+            };
+            (start % 4 == 0 && end <= bytes).then_some((start, end))
+        };
+        if let (Some((a, b)), Some((c, d))) = (fixed_range(first), fixed_range(second)) {
+            let cmp = p.blocks.iter().enumerate().find_map(|(b, block)| {
+                block.insts.iter().zip(&st.guards[b])
+                    .find(|(i, guard)| guard.is_none() && i.writes.iter().any(|&(_, v)| v == test))
+                    .map(|(i, _)| i)
+            })?;
+            let (zero, thread) = operands(cmp)?;
+            let thread = value(cmp, thread)?;
+            return Some(one_dimensional
+                && matches!(cmp.name(), "v_cmpx_eq_u32" | "v_cmp_eq_u32")
+                && imm(zero) == Some(0) && p.inputs.contains(&(Reg::V(0), thread))
+                && (b <= c || d <= a));
+        }
+        if !first.name().starts_with("ds_write") || !second.name().starts_with("ds_write") {
+            return None;
+        }
         // The comparison itself may narrow EXEC; only the lane-id
         // definitions must execute unconditionally in its block.
         let cmp = p.blocks[root].insts.iter().find(|i| i.writes.iter().any(|&(_, v)| v == test))?;
@@ -168,12 +483,12 @@ pub(super) fn independent_stores(
     proof().unwrap_or(false)
 }
 
-fn reconverged(succs: &[Vec<usize>]) -> Vec<bool> {
+fn reconverged(succs: &[Vec<usize>], splits: &[bool]) -> Vec<bool> {
     let n = succs.len();
     let ipdom = post_dominators(succs);
     let mut out = vec![true; n];
     for (d, edges) in succs.iter().enumerate() {
-        if edges.len() < 2 {
+        if edges.len() < 2 || !splits[d] {
             continue;
         }
         let stop = ipdom[d];
@@ -266,6 +581,6 @@ mod tests {
     fn watchdog_return_prevents_reconvergence_after_the_loop() {
         // 0 hands control to a loop; 2 can take its watchdog exit at 4.
         let graph = [vec![1], vec![2, 3], vec![1, 4], vec![], vec![]];
-        assert_eq!(super::reconverged(&graph), [true, false, false, false, false]);
+        assert_eq!(super::reconverged(&graph, &[true; 6]), [true, false, false, false, false]);
     }
 }

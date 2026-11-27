@@ -560,6 +560,39 @@ fn f16_max_and_min_order_negative_zero_below_positive_zero() {
 }
 
 #[test]
+fn f16_output_scaling_precedes_clamp_and_narrowing() {
+    for (omod, clamp, input, expected) in [
+        (1, false, 0.25f32, 0x3800),
+        (2, false, 0.25, 0x3c00),
+        (3, false, 65536.0, 0x7800),
+        (1, true, 0.75, 0x3c00),
+        (3, true, 1.5, 0x3a00),
+    ] {
+        let mut op = vop3(0x18a, 0, vgpr(1), 0, 0);
+        op[0] |= u32::from(clamp) << 15;
+        op[1] |= omod << 27;
+        let shader = build_valu_cs(&[vop1(0x001, 0, vgpr(4)), op[0], op[1]]);
+        run_cases(&shader, &[[input.to_bits(), 0, 0, 0x5a5a_1234]], |backend, _, _, got| {
+            assert_eq!(got, 0x5a5a_0000 | expected, "{backend}: omod {omod}, clamp {clamp}");
+        });
+    }
+}
+
+#[test]
+fn f16_arithmetic_scaling_and_integer_modifier_rejection() {
+    let mut add = vop3(0x132, 0, vgpr(1), vgpr(2), 0);
+    add[1] |= 3 << 27;
+    let shader = build_valu_cs(&[vop1(0x001, 0, vgpr(4)), add[0], add[1]]);
+    run_cases(&shader, &[[0x3c00, 0x3c00, 0, 0x5a5a_1234]], |backend, _, _, got| {
+        assert_eq!(got, 0x5a5a_3c00, "{backend}: scaled f16 addition");
+    });
+
+    let mut integer = vop3(0x303, 0, vgpr(1), vgpr(2), 0);
+    integer[1] |= 1 << 27;
+    assert!(try_build_valu_cs(&integer).is_err());
+}
+
+#[test]
 fn v_min3_max3_med3_integer_forms_match_rdna2() {
     // v_{min3,max3,med3}_{i32,u32} v0, v1, v2, v3 (VOP3 0x152..0x159).
     type Pick = fn([u32; 3]) -> u32;

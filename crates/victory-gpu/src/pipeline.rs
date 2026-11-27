@@ -309,19 +309,24 @@ pub(crate) fn shaders_of(this: This) -> String {
     format!("{:?}", pipeline(this).shaders)
 }
 
-/// Counts a draw or dispatch of `this` intentionally skipped or dropped
-/// for want of a host pipeline (diagnostics).
+/// The current reason a title pipeline is unavailable (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]
-pub(crate) fn note_drop(this: This) {
-    let why = if this.is_null() {
+pub(crate) fn drop_reason(this: This) -> Option<String> {
+    if this.is_null() {
         Some("no pipeline set".to_owned())
     } else {
         let p = pipeline(this);
         skipped_shader(p)
             .map(|hash| format!("skipped shader {hash}"))
             .or_else(|| make::missing(&p.host))
-    };
-    if let Some(why) = why {
+    }
+}
+
+/// Counts a draw or dispatch of `this` intentionally skipped or dropped
+/// for want of a host pipeline (diagnostics).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn note_drop(this: This) {
+    if let Some(why) = drop_reason(this) {
         note_why(why);
     }
 }

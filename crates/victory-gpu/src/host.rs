@@ -79,6 +79,9 @@ static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] =
 static COPY_BACK: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
+#[cfg(feature = "diagnostics")]
+static TEXTURE_WRITE_TRACE_POISONED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Of the preparing: title memory copies (microseconds, bytes) and texture
 /// refreshes (microseconds, bytes hashed), since the last frame-rate line.
 pub(crate) static PREPARING: [std::sync::atomic::AtomicU64; 4] = [
@@ -471,6 +474,24 @@ pub(crate) mod tests {
         assert!(!crate::shadow::take_reads().contains(&memory), "forgotten: its mark cleared");
         crate::shadow::tests::mark_read(true, memory);
         assert!(crate::shadow::take_reads().contains(&memory), "read again after it was forgotten");
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn texture_write_marks_are_separate_and_cleared_in_both_bitmaps() {
+        if !victory_shader::emit::trace_texture_writes() {
+            return;
+        }
+        let Some(host) = host() else { return };
+        let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let last = victory_shader::emit::HEAP_VIEWS - 1;
+        crate::shadow::tests::mark_read(false, last);
+        crate::shadow::tests::mark_texture_write(false, 0);
+        crate::shadow::tests::mark_texture_write(true, last);
+        let slots = crate::shadow::take_texture_writes();
+        assert!(slots.contains(&0) && slots.contains(&last));
+        assert!(!crate::shadow::take_texture_writes().contains(&last));
+        assert!(crate::shadow::reads_since().contains(&last), "read marks are not cleared");
     }
 
     /// The textures shaders read through the heap since the last eviction
@@ -1032,6 +1053,8 @@ struct Deferred {
     /// Work done once the list has run, before the bottom-of-pipe writes
     /// (title memory shaders wrote at addresses they computed goes back).
     after: Vec<Box<dyn Fn() + Send>>,
+    #[cfg(feature = "diagnostics")]
+    after_checked: Vec<Box<dyn Fn(bool) + Send>>,
     /// Asked once the list has run, before anything goes back: whether its
     /// shaders read title memory with no copy (`crate::memory`); then what
     /// they wrote through views does not go back either.
@@ -1273,6 +1296,18 @@ impl Host {
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
         let mut removed_in = None;
+        #[cfg(feature = "diagnostics")]
+        let mut completed = true;
+        #[cfg(feature = "diagnostics")]
+        let trace_first = *submitted + 1;
+        #[cfg(feature = "diagnostics")]
+        let trace_writes = victory_shader::emit::trace_texture_writes()
+            && !TEXTURE_WRITE_TRACE_POISONED.load(Ordering::Relaxed)
+            && !groups.is_empty();
+        #[cfg(feature = "diagnostics")]
+        if trace_writes {
+            crate::descriptor::host::begin_texture_writes();
+        }
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
@@ -1285,11 +1320,18 @@ impl Host {
                     .queue
                     .Signal(&self.fence, *submitted)
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
+                #[cfg(feature = "diagnostics")]
+                let signalled = waited.is_ok();
                 match waited {
                     Ok(()) => {
                         WaitForSingleObject(self.event, INFINITE);
                     }
                     Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
+                }
+                #[cfg(feature = "diagnostics")]
+                {
+                    let value = self.fence.GetCompletedValue();
+                    completed &= signalled && value != u64::MAX && value >= *submitted;
                 }
             }
             #[cfg(feature = "diagnostics")]
@@ -1337,6 +1379,18 @@ impl Host {
                 last_notes(runs),
                 removed_during(runs, removed_in)
             ));
+        }
+        #[cfg(feature = "diagnostics")]
+        if trace_writes {
+            if completed {
+                let slots = crate::shadow::take_texture_writes();
+                crate::descriptor::host::end_texture_writes(trace_first, *submitted, Some(&slots));
+            } else {
+                // A later fence cannot distinguish the unfinished work's marks.
+                TEXTURE_WRITE_TRACE_POISONED.store(true, Ordering::Relaxed);
+                crate::descriptor::host::end_texture_writes(trace_first, *submitted, None);
+                tracing::warn!("texture-write tracing disabled: submission fence was not verified");
+            }
         }
         // What shaders wrote goes back before the bottom-of-pipe writes,
         // which tell the title the GPU is done; each range once per
@@ -1420,6 +1474,14 @@ impl Host {
         for list in runs {
             for work in &list.deferred().after {
                 work();
+            }
+            #[cfg(feature = "diagnostics")]
+            if completed && runs.iter().filter(|other| std::ptr::eq(**other, *list)).count() > 1 {
+                tracing::warn!("diagnostic snapshot skipped: command list submitted more than once");
+            } else {
+                for work in &list.deferred().after_checked {
+                    work(completed);
+                }
             }
         }
         #[cfg(feature = "diagnostics")]
@@ -1646,6 +1708,42 @@ impl Host {
             self.device
                 .CreateRenderTargetView(resource, desc.map(|d| d as *const _), handle);
             handle
+        }
+    }
+    /// A typed null target, if its description can be made safely.
+    pub(crate) fn null_rtv(
+        &self,
+        desc: &D3D12_RENDER_TARGET_VIEW_DESC,
+    ) -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
+        let support = format_support(desc.Format).0;
+        if desc.Format.0 <= 0 || support & D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 == 0 {
+            return None;
+        }
+        // SAFETY: the descriptor's union occupies the four words after its header.
+        let words = unsafe { std::slice::from_raw_parts((desc as *const D3D12_RENDER_TARGET_VIEW_DESC).cast::<u32>(), 6) };
+        let array = |first: u32, count: u32| count != 0 && first.checked_add(count).is_some_and(|end| end <= 2048);
+        let valid = match desc.ViewDimension.0 {
+            1 => support & D3D12_FORMAT_SUPPORT1_BUFFER.0 != 0 && words[4] != 0,
+            2 => support & D3D12_FORMAT_SUPPORT1_TEXTURE1D.0 != 0 && words[2] < 15,
+            3 => support & D3D12_FORMAT_SUPPORT1_TEXTURE1D.0 != 0 && words[2] < 15 && array(words[3], words[4]),
+            4 => support & D3D12_FORMAT_SUPPORT1_TEXTURE2D.0 != 0 && words[2] < 15 && words[3] == 0,
+            5 => support & D3D12_FORMAT_SUPPORT1_TEXTURE2D.0 != 0 && words[2] < 15 && array(words[3], words[4]) && words[5] == 0,
+            6 => support & D3D12_FORMAT_SUPPORT1_TEXTURE2D.0 != 0,
+            7 => support & D3D12_FORMAT_SUPPORT1_TEXTURE2D.0 != 0 && array(words[2], words[3]),
+            8 => support & D3D12_FORMAT_SUPPORT1_TEXTURE3D.0 != 0 && words[2] < 12
+                && (array(words[3], words[4]) || words[3] < 2048 && words[4] == u32::MAX),
+            _ => false,
+        };
+        if !valid {
+            return None;
+        }
+        let slot = self.next_rtv.fetch_add(1, Ordering::Relaxed) % RTV_RING;
+        // SAFETY: a heap slot and a validated typed null view description.
+        unsafe {
+            let mut handle = self.rtvs.GetCPUDescriptorHandleForHeapStart();
+            handle.ptr += (slot * self.rtv_size) as usize;
+            self.device.CreateRenderTargetView(None, Some(desc), handle);
+            Some(handle)
         }
     }
 
@@ -2163,6 +2261,12 @@ impl HostList {
         self.deferred().after.push(Box::new(work));
     }
 
+    /// Runs diagnostic work with the submission's verified fence status.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn defer_after_checked(&self, work: impl Fn(bool) + Send + 'static) {
+        self.deferred().after_checked.push(Box::new(work));
+    }
+
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
     pub(crate) fn defer_write(&self, dst: *mut u8, what: crate::queue::Written, bytes: usize) {
         self.deferred().writes.push((dst as usize, what, bytes));
@@ -2185,6 +2289,8 @@ impl HostList {
     pub(crate) fn is_empty(&self) -> bool {
         let d = self.deferred();
         let deferred_empty = d.copies.is_empty() && d.uploads.is_empty() && d.writes.is_empty() && d.after.is_empty() && d.missed.is_empty();
+        #[cfg(feature = "diagnostics")]
+        let deferred_empty = deferred_empty && d.after_checked.is_empty();
         drop(d);
         deferred_empty
             && self.states.lock().unwrap_or_else(|e| e.into_inner()).is_empty()

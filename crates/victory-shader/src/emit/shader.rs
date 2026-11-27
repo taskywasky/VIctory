@@ -122,6 +122,21 @@ pub const VIEW_WRITE_BITS: u32 = 1 << 22;
 /// marks"), after the written pages in the same bitmap: one bit per
 /// resource-heap index, [`HEAP_VIEWS`] of them.
 pub const VIEW_READS: u32 = VIEW_WRITE_BITS;
+/// The first bit of transient heap-direct texture write marks, one per host
+/// heap slot, following the persistent texture read marks.
+pub const VIEW_TEXTURE_WRITES: u32 = VIEW_READS + HEAP_VIEWS;
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TEST_TEXTURE_WRITES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn texture_write_marks() -> bool {
+    #[cfg(test)]
+    { TEST_TEXTURE_WRITES.get() }
+    #[cfg(not(test))]
+    { super::trace_texture_writes() }
+}
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
@@ -630,8 +645,8 @@ impl Shader {
         if !sampler && (matches!(kind, 10 | 12) || kind == 11 && props.0 & 0x1000 != 0) {
             self.view_index.insert(h, index);
         }
-        // Texture shader views (kinds 1-9).
-        if !sampler && props.0 & 0x1000 == 0 && (1..=9).contains(&kind) {
+        // Texture shader and unordered views (kinds 1-9).
+        if !sampler && (1..=9).contains(&kind) {
             self.texture_index.insert(h, index);
         }
         h

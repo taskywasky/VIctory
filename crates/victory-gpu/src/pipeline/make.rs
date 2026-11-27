@@ -217,14 +217,38 @@ pub(crate) fn early(p: &Arc<Pending>) {
     }
 }
 
+/// A waiting thread reserves the remaining frame budget until its wait ends.
+struct WaitBudget(Mutex<(u64, Duration)>);
+
+impl WaitBudget {
+    fn reserve(&self, frame: u64) -> Duration {
+        let mut spent = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if frame < spent.0 {
+            return Duration::ZERO;
+        }
+        if frame > spent.0 {
+            *spent = (frame, Duration::ZERO);
+        }
+        let left = BUDGET.saturating_sub(spent.1);
+        spent.1 += left;
+        left
+    }
+
+    fn finish(&self, frame: u64, reserved: Duration, waited: Duration) {
+        let mut spent = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if spent.0 == frame {
+            spent.1 = spent.1.saturating_sub(reserved.saturating_sub(waited));
+        }
+    }
+}
+
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
-    static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
-    static WAITED_US: AtomicU64 = AtomicU64::new(0);
-    if FRAME.swap(frame, Ordering::Relaxed) != frame {
-        WAITED_US.store(0, Ordering::Relaxed);
+    static SPENT: WaitBudget = WaitBudget(Mutex::new((0, Duration::ZERO)));
+    let left = SPENT.reserve(frame);
+    if left.is_zero() {
+        return;
     }
-    let left = BUDGET.saturating_sub(Duration::from_micros(WAITED_US.load(Ordering::Relaxed)));
     let started = Instant::now();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -235,7 +259,7 @@ fn wait(p: &Pending, frame: u64) {
         }
         held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
     }
-    WAITED_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    SPENT.finish(frame, left, started.elapsed().min(left));
 }
 
 /// Pipelines for the workers: those draws wait for, then those started
@@ -335,6 +359,53 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wait_budget_is_reserved_and_unused_time_returned() {
+        let budget = WaitBudget(Mutex::new((0, Duration::ZERO)));
+        let first = budget.reserve(1);
+        assert_eq!(first, BUDGET);
+        assert_eq!(budget.reserve(1), Duration::ZERO);
+        budget.finish(1, first, Duration::from_millis(125));
+        let second = budget.reserve(1);
+        assert_eq!(second, Duration::from_millis(375));
+        budget.finish(1, second, second);
+        assert_eq!(budget.reserve(1), Duration::ZERO);
+    }
+
+    #[test]
+    fn concurrent_waits_share_one_budget() {
+        let budget = WaitBudget(Mutex::new((0, Duration::ZERO)));
+        let barrier = std::sync::Barrier::new(3);
+        std::thread::scope(|scope| {
+            let a = scope.spawn(|| {
+                barrier.wait();
+                budget.reserve(1)
+            });
+            let b = scope.spawn(|| {
+                barrier.wait();
+                budget.reserve(1)
+            });
+            barrier.wait();
+            let (a, b) = (a.join().unwrap(), b.join().unwrap());
+            assert_eq!(a + b, BUDGET);
+            assert!(a.is_zero() || b.is_zero());
+        });
+    }
+
+    #[test]
+    fn wait_budget_rejects_stale_frames_and_completions() {
+        let budget = WaitBudget(Mutex::new((0, Duration::ZERO)));
+        let old = budget.reserve(1);
+        let current = budget.reserve(2);
+        assert_eq!(old, BUDGET);
+        assert_eq!(current, BUDGET);
+        budget.finish(1, old, Duration::ZERO);
+        assert_eq!(budget.reserve(1), Duration::ZERO);
+        assert_eq!(budget.reserve(2), Duration::ZERO);
+        budget.finish(2, current, Duration::ZERO);
+        assert_eq!(budget.reserve(2), BUDGET);
+    }
 
     /// An early start is queued once; a draw waiting for it puts it ahead,
     /// once, unless a worker has taken it.

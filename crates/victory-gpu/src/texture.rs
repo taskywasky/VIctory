@@ -179,8 +179,9 @@ unsafe impl Send for Chunks {}
 static CHUNKS: Mutex<Chunks> = Mutex::new(Chunks { all: Vec::new(), current: 0, used: 0 });
 
 const CHUNK: u64 = 32 << 20;
-/// Chunks kept between submissions (more are made while one needs them).
-const CHUNKS_KEPT: usize = 16;
+/// Keep 128 MiB between submissions; larger bursts release their excess
+/// after the GPU finishes, but can still allocate as many chunks as needed.
+const CHUNKS_KEPT: usize = 4;
 
 /// `size` bytes of staging space: a buffer, the offset of the space in it
 /// (a multiple of 512, as texture copies need) and its mapping there.
@@ -574,11 +575,12 @@ impl Staging {
             // each cost up to 430 MB a frame, run integ2).
             let n = self.footprints.len();
             let span = |i: usize| self.spans.get(i).copied().unwrap_or((0, size));
-            let touched: Vec<usize> = (0..n)
+            let mut fresh: Vec<u32> = (0..n)
                 .filter(|&i| {
                     let (a, b) = span(i);
                     ranges.iter().any(|&(f, e)| f - start < b && a < e - start)
                 })
+                .map(|i| i as u32)
                 .collect();
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page. Not kept: it would
@@ -588,8 +590,8 @@ impl Staging {
             let read = &mut scratch.0[..size];
             let mut bytes = 0;
             let mut done: Vec<(usize, usize)> = Vec::new();
-            for &i in &touched {
-                let (a, b) = span(i);
+            for &i in &fresh {
+                let (a, b) = span(i as usize);
                 if !done.contains(&(a, b)) {
                     // SAFETY: inside the buffer of the texture's size.
                     crate::host::copy_mapped(unsafe { read.as_mut_ptr().add(a) }, self.memory.wrapping_add(a), b - a, false);
@@ -602,20 +604,17 @@ impl Staging {
             // cost 8 ms a frame.)
             let page = crate::watch::PAGE;
             last.hashes.resize(n, None);
-            let fresh: Vec<u32> = touched
-                .into_iter()
-                .filter(|&i| {
-                    let (a, b) = span(i);
-                    let (a0, b0) = (start + a, start + b);
-                    if ranges.iter().any(|&(f, e)| f.max(a0).next_multiple_of(page) + page <= e.min(b0)) {
-                        last.hashes[i] = None;
-                        return true;
-                    }
-                    let hash = blake3::hash(&read[a..b]);
-                    last.hashes[i].replace(hash) != Some(hash)
-                })
-                .map(|i| i as u32)
-                .collect();
+            fresh.retain(|&i| {
+                let i = i as usize;
+                let (a, b) = span(i);
+                let (a0, b0) = (start + a, start + b);
+                if ranges.iter().any(|&(f, e)| f.max(a0).next_multiple_of(page) + page <= e.min(b0)) {
+                    last.hashes[i] = None;
+                    return true;
+                }
+                let hash = blake3::hash(&read[a..b]);
+                last.hashes[i].replace(hash) != Some(hash)
+            });
             if fresh.is_empty() {
                 return (bytes, None);
             }

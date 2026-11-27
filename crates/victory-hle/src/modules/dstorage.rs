@@ -4,6 +4,9 @@
 //! slots here are the ones Grand Theft Auto VI calls, read from its call
 //! sites. Slots nobody has needed yet log their offset.
 //!
+//! Requests normally start only after Submit: the title maps their
+//! destinations and fills page lists after enqueueing the batch.
+//!
 //! Submitted requests of every queue run on one pool of workers, as the
 //! console's hardware runs them: in parallel, started in queue order,
 //! queues served by weighted round robin over their priorities (about 10x
@@ -374,9 +377,6 @@ struct Lane {
     clock: u64,
     /// Enqueued, not yet submitted.
     unsubmitted: Vec<Command>,
-    /// Left out when the queue submitted itself, until the title's Submit:
-    /// reads into physical pages and the status entries behind them.
-    held: Vec<Command>,
     /// Submitted, by sequence number: reads not started, status entries
     /// not written, reads running, and failures not yet reported.
     reads: VecDeque<(u64, Request)>,
@@ -559,17 +559,6 @@ impl Lanes {
     /// Moves a queue's enqueued commands to the workers (the title's
     /// Submit).
     fn submit(&mut self, id: u64) {
-        self.submit_as(id, true);
-    }
-
-    /// As [`Lanes::submit`]; `explicit` false when a half-full queue submits
-    /// itself, which leaves reads into physical pages for the title's
-    /// Submit: their page lists point into the title's page table, which
-    /// Grand Theft Auto VI fills for the batch in its own submit path, right
-    /// before Submit (`sub_1400e88f0`), so until then they name no page or a
-    /// page that now holds something else. A status entry behind a held
-    /// read waits with it.
-    fn submit_as(&mut self, id: u64, explicit: bool) {
         let Some(class) = self.lanes.get(&id).map(|l| l.class) else {
             return;
         };
@@ -588,18 +577,7 @@ impl Lanes {
         if lane.reads.is_empty() {
             lane.clock = lane.clock.max(self.lane_now[class]);
         }
-        let mut commands = if explicit { std::mem::take(&mut lane.held) } else { Vec::new() };
-        commands.append(&mut lane.unsubmitted);
-        for command in commands {
-            let hold = !explicit
-                && match &command {
-                    Command::Read(r) => r.options & PAGE_DESTINATION != 0,
-                    Command::Status(_) => !lane.held.is_empty(),
-                };
-            if hold {
-                lane.held.push(command);
-                continue;
-            }
+        for command in std::mem::take(&mut lane.unsubmitted) {
             let seq = self.next_seq;
             self.next_seq += 1;
             match command {
@@ -618,7 +596,6 @@ impl Lane {
             capacity: usize::from(capacity),
             clock: 0,
             unsubmitted: Vec::new(),
-            held: Vec::new(),
             reads: VecDeque::new(),
             statuses: VecDeque::new(),
             running: BTreeSet::new(),
@@ -627,13 +604,9 @@ impl Lane {
         }
     }
 
-    /// Requests and status entries held, submitted or not.
+    /// Requests and status entries, submitted or not.
     fn entries(&self) -> usize {
-        self.unsubmitted.len()
-            + self.held.len()
-            + self.reads.len()
-            + self.statuses.len()
-            + self.running.len()
+        self.unsubmitted.len() + self.reads.len() + self.statuses.len() + self.running.len()
     }
 
     /// Writes the status entries whose earlier reads have all finished.
@@ -681,7 +654,6 @@ fn close_lane(id: u64) {
     };
     lane.closed = true;
     lane.unsubmitted.clear();
-    lane.held.clear();
     lane.reads.clear();
     lane.statuses.clear(); // releases their arrays
     while lanes.lanes.get(&id).is_some_and(|l| !l.running.is_empty()) {
@@ -776,8 +748,7 @@ extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
     queue(this, Command::Status(Status { array, index }));
 }
 
-/// Adds a command to the queue; blocks while the queue is full, and
-/// submits on its own once half of it is enqueued, as the console does.
+/// Adds a command, submitting a full queue if no submitted reads can make room.
 fn queue(this: QueueRef, command: Command) {
     // SAFETY: a queue we created and the title still holds.
     let id = unsafe { &*this }.state.id;
@@ -793,15 +764,16 @@ fn queue(this: QueueRef, command: Command) {
         if lane.entries() + 1 < lane.capacity.max(2) {
             break;
         }
-        // Full with reads held for a Submit the title cannot make while it
-        // waits here: they go now, page lists as they are.
-        if !lane.held.is_empty() {
-            static WARNED: AtomicBool = AtomicBool::new(false);
-            if !WARNED.swap(true, Ordering::Relaxed) {
-                tracing::warn!("dstorage: a full queue's reads into physical pages start before the title's Submit");
-            }
+        if !lane.unsubmitted.is_empty() && lane.reads.is_empty() && lane.running.is_empty() {
+            tracing::warn!(
+                queue = id,
+                commands = lane.unsubmitted.len(),
+                "dstorage: a full queue submits before the title's Submit"
+            );
             lanes.submit(id);
+            scheduler.finished.notify_all();
             scheduler.work.notify_all();
+            continue;
         }
         lanes = scheduler
             .finished
@@ -812,21 +784,6 @@ fn queue(this: QueueRef, command: Command) {
         return;
     };
     lane.unsubmitted.push(command);
-    if lane.unsubmitted.len() >= (lane.capacity / 2).max(1) {
-        let capacity = lane.capacity;
-        lanes.submit_as(id, false);
-        scheduler.work.notify_all();
-        let held = lanes.lanes.get(&id).map_or(0, |l| l.held.len());
-        let n = AUTO_SUBMITS.fetch_add(1, Ordering::Relaxed) + 1;
-        if n.is_power_of_two() {
-            tracing::info!(
-                n,
-                capacity,
-                held,
-                "dstorage: a queue half full submitted itself; reads into physical pages wait for the title's Submit"
-            );
-        }
-    }
 }
 
 extern "system" fn submit(this: QueueRef) {
@@ -836,9 +793,10 @@ extern "system" fn submit(this: QueueRef) {
         return;
     };
     let mut lanes = scheduler.lock();
-    let pending = lanes.lanes.get(&id).map_or(0, |l| l.unsubmitted.len() + l.held.len());
+    let pending = lanes.lanes.get(&id).map_or(0, |l| l.unsubmitted.len());
     tracing::debug!(commands = pending, "dstorage: submit");
     lanes.submit(id);
+    scheduler.finished.notify_all();
     scheduler.work.notify_all();
 }
 
@@ -1099,12 +1057,8 @@ fn into_destination(
     if super::xmem::write_physical(pages, offset, &data[..n]) {
         return Ok(());
     }
-    // Page number 0 is no page (numbers start at 0x10_0000): a list naming
-    // it is one the title has not filled yet. The title writes a request's
-    // page list after enqueueing it, and a queue half full is submitted on
-    // its own, so a read can start first. Read the list again for a few
-    // milliseconds before failing: the title never looks at a request's
-    // result, so a failed one is a model or texture left unwritten.
+    // A full queue can be forced to start before the title fills its list.
+    // Retry briefly when page 0 indicates that the list is not ready yet.
     if pages.contains(&0) {
         for _ in 0..LATE_LIST_TRIES {
             std::thread::sleep(std::time::Duration::from_millis(1));
@@ -1146,9 +1100,6 @@ fn source_name(request: &Request) -> &str {
     // SAFETY: a file object we created; the title keeps it open.
     &unsafe { &*request.source.cast::<Instance<File>>() }.state.path
 }
-
-/// Queues that submitted themselves, half full (diagnostics).
-static AUTO_SUBMITS: AtomicU32 = AtomicU32::new(0);
 
 /// Milliseconds a page list naming page 0 is read again for.
 const LATE_LIST_TRIES: u32 = 8;
@@ -1229,11 +1180,15 @@ mod tests {
     }
 
     fn new_queue(source_type: u64) -> *mut c_void {
+        new_queue_with_capacity(source_type, 0x80)
+    }
+
+    fn new_queue_with_capacity(source_type: u64, capacity: u16) -> *mut c_void {
         let create: extern "system" fn(*mut c_void, *const QueueDesc, *const Guid, Out) -> HRESULT =
             call(factory(), 0x50);
         let desc = QueueDesc {
             source_type,
-            capacity: 0x80,
+            capacity,
             priority: 0,
             name: c"test".as_ptr(),
             unknown: 1,
@@ -1405,25 +1360,58 @@ mod tests {
     }
 
     #[test]
-    fn half_a_queue_submits_itself() {
-        let (_dir, file) = file_with(&pattern(64));
-        let create: extern "system" fn(*mut c_void, *const QueueDesc, *const Guid, Out) -> HRESULT =
-            call(factory(), 0x50);
-        let desc = QueueDesc {
-            source_type: 0,
-            capacity: 4,
-            priority: 1,
-            name: c"small".as_ptr(),
-            unknown: 1,
-        };
-        let mut queue = std::ptr::null_mut();
-        assert_eq!(create(factory(), &desc, std::ptr::null(), &mut queue), S_OK);
-        let array = status_array(1);
+    fn non_page_reads_wait_for_explicit_submit() {
+        let (queue, array) = (new_queue_with_capacity(1, 4), status_array(1));
+        let mut source = [1u8; 16];
         let mut out = [0u8; 16];
-        enqueue(queue, &request(0, out.as_mut_ptr().cast(), 16, file, 8, 16));
-        enqueue_status(queue, array, 0); // the second of four: no submit needed
+        enqueue(queue, &request(MEMORY_SOURCE, out.as_mut_ptr().cast(), 16, source.as_ptr().cast(), 0, 16));
+        enqueue_status(queue, array, 0);
+        {
+            let lanes = scheduler().unwrap().lock();
+            let id = unsafe { &*queue.cast::<Instance<Queue>>() }.state.id;
+            let lane = &lanes.lanes[&id];
+            assert_eq!(lane.unsubmitted.len(), 2);
+            assert!(lane.reads.is_empty() && lane.running.is_empty());
+            assert_eq!(result(array, 0), E_PENDING);
+        }
+        source.fill(7);
+        void(queue, 0x30);
         assert_eq!(wait(array, 0), S_OK);
-        assert_eq!(out, pattern(64)[8..24]);
+        assert_eq!(out, source);
+        void(queue, 0x40);
+    }
+
+    #[test]
+    fn a_full_queue_forces_submission_and_preserves_statuses() {
+        let (queue, array) = (new_queue_with_capacity(1, 4), status_array(2));
+        let source = [7u8; 16];
+        let mut out = [[0u8; 16]; 3];
+        enqueue(queue, &request(MEMORY_SOURCE, out[0].as_mut_ptr().cast(), 16, source.as_ptr().cast(), 0, 16));
+        enqueue_status(queue, array, 0);
+        enqueue(queue, &request(MEMORY_SOURCE, out[1].as_mut_ptr().cast(), 16, source.as_ptr().cast(), 0, 16));
+        // The fourth command cannot fit until the first batch makes room.
+        enqueue(queue, &request(MEMORY_SOURCE, out[2].as_mut_ptr().cast(), 16, source.as_ptr().cast(), 0, 16));
+        enqueue_status(queue, array, 1);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 1), S_OK);
+        assert_eq!(result(array, 0), S_OK);
+        assert_eq!(out, [source; 3]);
+        void(queue, 0x40);
+    }
+
+    #[test]
+    fn a_full_queue_of_statuses_makes_room_without_workers() {
+        let (queue, array) = (new_queue_with_capacity(1, 4), status_array(4));
+        for index in 0..4 {
+            enqueue_status(queue, array, index);
+        }
+        for index in 0..3 {
+            assert_eq!(result(array, index), S_OK);
+        }
+        assert_eq!(result(array, 3), E_PENDING);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 3), S_OK);
+        void(queue, 0x40);
     }
 
     /// Lanes without workers: what `start` picks, and when statuses land.
@@ -1706,30 +1694,6 @@ mod tests {
         let seen = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>(), plain.len()) };
         assert_eq!(seen, plain);
     }
-    #[test]
-    fn a_queue_that_submits_itself_holds_reads_into_pages() {
-        let mut l = lanes(STAGING);
-        l.lanes.insert(0, Lane::new(0, 64));
-        let array = status_array(1).cast::<Instance<StatusArray>>();
-        read(&mut l, 0, PAGE_DESTINATION, 16);
-        read(&mut l, 0, 0, 16);
-        add_ref_instance(array);
-        l.lanes.get_mut(&0).unwrap().unsubmitted.push(Command::Status(Status { array, index: 0 }));
-        l.submit_as(0, false);
-        // Only the plain read starts; the status waits behind the held one.
-        let plain = l.start().unwrap();
-        assert_eq!(plain.request.options, 0);
-        assert!(l.start().is_none());
-        l.finish(&plain, Ok(()));
-        assert_eq!(l.lanes[&0].held.len(), 2);
-        l.submit(0);
-        let paged = l.start().unwrap();
-        assert_eq!(paged.request.options, PAGE_DESTINATION);
-        assert!(l.lanes[&0].held.is_empty());
-        assert!(!l.lanes[&0].statuses.is_empty());
-        l.finish(&paged, Ok(()));
-        assert!(l.lanes[&0].statuses.is_empty());
-    }
 
     #[test]
     fn a_page_list_the_title_changes_before_its_submit() {
@@ -1775,9 +1739,12 @@ mod tests {
         enqueue(queue, &r);
         let mut out = [0u8; 16];
         enqueue(queue, &request(MEMORY_SOURCE, out.as_mut_ptr().cast(), 16, plain.as_ptr().cast(), 0, 16));
-        // Half of four: the queue submitted itself. Time for a read started
-        // then to land in the old page.
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        // Even the non-page read remains queued until the title submits.
+        {
+            let lanes = scheduler().unwrap().lock();
+            let id = unsafe { &*queue.cast::<Instance<Queue>>() }.state.id;
+            assert_eq!(lanes.lanes[&id].unsubmitted.len(), 2);
+        }
         // SAFETY: the list outlives the request, which reads it when it runs.
         unsafe { std::ptr::write_volatile(list.as_mut_ptr(), pages[1]) };
         enqueue_status(queue, array, 0);
